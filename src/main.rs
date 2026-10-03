@@ -159,7 +159,14 @@ fn run(job: &Value) -> Result<Value, String> {
     let mut threads = vyges_gpl::run::Threads { asked: 1, cores: physical_core_count() };
     let mut log = Log::default();
     let finish = |log: Log, stop: Option<String>, extra: Value| {
-        let mut v = json!({"lines": log.lines, "trace": log.trace, "stop": stop});
+        let (status, reason) = match stop {
+            None => ("placed".to_string(), None),
+            Some(s) => match s.split_once(": ") {
+                Some((st, r)) => (st.to_string(), Some(r.to_string())),
+                None => (s, None),
+            },
+        };
+        let mut v = json!({"tool": "vyges-gpl", "status": status, "reason": reason, "lines": log.lines, "trace": log.trace});
         if let (Some(o), Value::Object(x)) = (v.as_object_mut(), extra) {
             o.extend(x);
         }
@@ -195,36 +202,232 @@ fn run(job: &Value) -> Result<Value, String> {
         })();
         match r {
             Ok(None) => {}
-            Ok(Some(Outcome::InitiallyPlaced(c, bases))) => {
-                let extra = json!({"outcome": "initially_placed", "insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins,
+            Ok(Some(Outcome::InitiallyPlaced(c, bases, ip, skip_nesterov))) => {
+                let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins,
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
+                if !skip_nesterov {
+                    // What is modelled ends here; Nesterov placement is not, so the command is
+                    // refused rather than reported as done.
+                    let mut v = finish(log, Some("refused: Nesterov placement is not modelled yet".into()), extra);
+                    v["modelled_through"] = json!("initial_place");
+                    return Ok(v);
+                }
+                // -skip_nesterov_place: initial placement is the whole command. Each instance it
+                // moved goes to its database box's lower-left, PLACED (dbSetCenterLocation,
+                // dbSetPlaced).
+                let db = db.as_mut().expect("read before global_placement");
+                let names = db.block_get_insts();
+                for &k in &ip.place {
+                    let di = c.insts[k].db.expect("a placed instance is a design instance");
+                    let b = ip.db_bbox[di];
+                    let e = |e: vyges_opendb::Error| format!("{}: {e}", names[di]);
+                    db.set_inst_location(&names[di], b.lx, b.ly).map_err(e)?;
+                    db.inst_set_placement_status(&names[di], "PLACED").map_err(e)?;
+                }
+                if let Some(path) = job["write_def"].as_str() {
+                    db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
+                }
                 return Ok(finish(log, None, extra));
             }
-            Err(Stop::Error { tool, id }) => return Ok(finish(log, Some(format!("error {tool}-{id:04}")), json!({}))),
+            Err(Stop::Error { tool, id }) => {
+                let mut v = finish(log, Some(format!("error: {tool}-{id:04}")), json!({}));
+                v["code"] = json!(format!("{tool}-{id:04}"));
+                return Ok(v);
+            }
             Err(Stop::Refused(why)) => return Ok(finish(log, Some(format!("refused: {why}")), json!({}))),
         }
     }
-    Ok(finish(log, Some("refused: no global_placement step".into()), json!({})))
+    // No global_placement step: nothing was placed or checked.
+    Ok(finish(log, Some("vacuous: the job has no global_placement step".into()), json!({})))
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(path) = args.get(1) else {
-        eprintln!("usage: vyges-gpl <job.json>");
-        std::process::exit(2);
-    };
-    let job: Value = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            std::process::exit(2);
+const USAGE: &str = "\
+vyges loom gpl — global placement: the placer's view of the design (instances, nets, pins,
+regions) and the initial placement (Nesterov placement is not modelled yet)
+
+USAGE:
+  vyges loom gpl global_placement <job.json> [-o FILE]
+  vyges loom gpl --describe
+  vyges loom gpl --help
+  vyges loom gpl --version
+
+JOB FIELDS:
+  steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}:
+               read_db, set_debug_level, set_thread_count, then global_placement [options]
+  write_def    with -skip_nesterov_place: write the placed design, as DEF, to this path
+
+MODELLED:
+  the placer's construction (GPL-0001..0021, 0035..0037: instances, fixed ones snapped to
+  sites, padding, the pin-density area adjustment, nets and pins, unusable-site dummies), and the
+  initial placement — every bound-to-bound round and its [InitialPlace] line, the solver's
+  arithmetic in the reference's own operation order. With -skip_nesterov_place that is the
+  whole command (status placed); otherwise the command is refused after it
+  (modelled_through: initial_place). Refused: -incremental, -place_ios, region groups,
+  placement clusters.
+
+OPTIONS:
+  -o FILE               write the JSON report to FILE instead of stdout
+  --json                accepted; the report is JSON either way
+  --describe            print a machine-readable JSON description of the command
+  --bug-report          file a bug (central: vyges/community)
+  --feature-request     request a feature (central)
+  --sponsor             sponsor Vyges (github.com/sponsors/vyges-ip)
+  --star                star this tool on GitHub
+
+EXIT STATUS:
+  0  placed       -skip_nesterov_place: the design initially placed
+  2  vacuous      the job has no global_placement step. NOT a pass.
+  2  error        usage, unreadable input, or an error the command raises (its line is reported)
+  3  refused      an input this engine does not model — or a Nesterov placement to run
+";
+
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, vyges_opendb::OPENROAD_PIN)
+}
+
+const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
+  "name": "gpl",
+  "summary": "global placement: the placer's construction and the bound-to-bound initial placement",
+  "maturity": "experimental",
+  "provenance_limitations": [
+    "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
+    "status is one of placed, vacuous, refused or error. placed means the design was initially placed and the command asked for no more (-skip_nesterov_place). A full global_placement is refused after the initial placement (modelled_through: initial_place). The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
+    "Modelled: the placer's construction and the initial placement, bit-exact against the reference. Refused rather than guessed: -incremental, -place_ios, region groups, placement clusters."
+  ],
+  "invocation": {
+    "args_template": ["global_placement", "{job}"],
+    "optional": [ { "arg": "out", "flag": "-o" } ],
+    "emits_json": true
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["job"],
+    "properties": {
+      "job": { "type": "string", "description": "path to a JSON job: {steps: [{cmd, args}], write_def}" },
+      "out": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
+    }
+  },
+  "consumes": ["job"],
+  "artifacts": [],
+  "assertion": {
+    "id": "design-placed",
+    "field": "status",
+    "pass_when": { "in": ["placed"] }
+  }
+}"#;
+
+fn link(flag: &str) -> Option<(&'static str, &'static str)> {
+    Some(match flag {
+        "--bug-report" => ("Report a bug", "https://github.com/vyges/community/issues/new?template=bug_report_template.yaml"),
+        "--feature-request" => ("Request a feature", "https://github.com/vyges/community/issues/new?labels=enhancement"),
+        "--sponsor" => ("Sponsor Vyges", "https://github.com/sponsors/vyges-ip"),
+        "--star" => ("Star this tool", "https://github.com/vyges-tools/gpl"),
+        _ => return None,
+    })
+}
+
+fn exit_for(status: &str) -> u8 {
+    match status {
+        "placed" => 0,
+        "refused" => 3,
+        _ => 2,
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    use std::process::ExitCode;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut out: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => match args.get(i + 1) {
+                Some(v) => {
+                    out = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("vyges-gpl: -o needs a FILE");
+                    return ExitCode::from(2);
+                }
+            },
+            "--json" => {}
+            a if a.starts_with('-') && !positional.is_empty() => {
+                eprintln!("vyges-gpl: unknown option {a}\n\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            a => positional.push(a),
         }
-    };
-    match run(&job) {
-        Ok(v) => println!("{v}"),
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
+        i += 1;
+    }
+    match positional.first().copied() {
+        None | Some("-h") | Some("--help") => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
         }
+        Some("-V") | Some("--version") => {
+            println!("vyges-gpl {} ({})\nCopyright (c) Vyges. Apache-2.0.", env!("CARGO_PKG_VERSION"), env!("VYGES_GIT_SHA"));
+            return ExitCode::SUCCESS;
+        }
+        Some("--describe") => {
+            println!("{}", describe());
+            return ExitCode::SUCCESS;
+        }
+        Some(f) if link(f).is_some() => {
+            let (label, url) = link(f).expect("a link flag");
+            println!("{label}:\n  {url}");
+            return ExitCode::SUCCESS;
+        }
+        Some("global_placement") if positional.len() == 2 => {}
+        _ => {
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    let path = positional[1];
+    let report = match std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}")).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|e| format!("{path}: {e}"))) {
+        Err(e) => json!({ "tool": "vyges-gpl", "status": "error", "reason": e }),
+        Ok(job) => match run(&job) {
+            Ok(r) => r,
+            Err(e) => json!({ "tool": "vyges-gpl", "status": "error", "reason": e }),
+        },
+    };
+    let status = report["status"].as_str().unwrap_or("error").to_string();
+    let text = format!("{report}\n");
+    match &out {
+        Some(f) => {
+            if let Err(e) = std::fs::write(f, &text) {
+                eprintln!("vyges-gpl: {f}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        None => print!("{text}"),
+    }
+    ExitCode::from(exit_for(&status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_descriptor_is_valid_json_and_names_the_engine() {
+        let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
+        assert_eq!(d["name"], "gpl");
+        assert_eq!(d["openroad_pin"].as_str().map(str::len), Some(40));
+    }
+
+    // Rule (vacuous convention): only a placed design exits 0; a refusal never does.
+    #[test]
+    fn only_placed_exits_zero() {
+        assert_eq!(exit_for("placed"), 0);
+        assert_eq!(exit_for("refused"), 3);
+        assert_eq!(exit_for("vacuous"), 2);
+        assert_eq!(exit_for("error"), 2);
     }
 }

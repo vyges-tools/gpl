@@ -7,7 +7,7 @@
 //! run stops there ([`Outcome::InitiallyPlaced`]): Nesterov placement is slice 3.
 
 use crate::log::{refuse, Log, Res};
-use crate::initial_place::{self, IpVars};
+use crate::initial_place::{self, Ip, IpVars};
 use crate::placer_base::{self, Base, Common, Design, Vars};
 use std::collections::BTreeMap;
 
@@ -31,7 +31,9 @@ const FLAGS: &[&str] = &[
 /// first unless it had no movable instance) and initially placed; Nesterov placement is next.
 #[derive(Debug)]
 pub enum Outcome {
-    InitiallyPlaced(Common, Vec<Base>),
+    /// The placer, its bases, the initial placement's state (each database box as it left it), and
+    /// whether the command stops there (`-skip_nesterov_place`).
+    InitiallyPlaced(Common, Vec<Base>, Ip, bool),
 }
 
 /// `sta::parse_key_args` then `check_argc_eq0`: exact keys and flags, else the first key, then
@@ -123,11 +125,11 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     }
     // The thread count does not change construction; the message is the command's first line.
     let _threads = placement_threads(log, threads);
-    do_initial_place(log, d, &vars, &ip)
+    do_initial_place(log, d, &vars, &ip, flag("-skip_nesterov_place"))
 }
 
 /// `Replace::doInitialPlace`, to the placer's construction.
-fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars) -> Res<Outcome> {
+fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, skip_nesterov: bool) -> Res<Outcome> {
     check_has_core_rows(log, d)?;
     if v.place_ios {
         return refuse("-place_ios (checkPlaceIosSupported: the die polygon) is not modelled");
@@ -146,8 +148,8 @@ fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars) -> Res<Ou
     if d.regions.iter().any(|r| !r.groups.is_empty()) {
         return refuse("initial placement with region groups is not modelled");
     }
-    initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
-    Ok(Outcome::InitiallyPlaced(common, bases))
+    let ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
+    Ok(Outcome::InitiallyPlaced(common, bases, ip, skip_nesterov))
 }
 
 /// `checkHasCoreRows` (`dbHasCoreRows`: a row whose site is not a PAD site).

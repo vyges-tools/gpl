@@ -1,0 +1,14 @@
+[book]
+title = "vyges-gpl"
+description = "Global placement: the placer's construction and the bound-to-bound initial placement"
+authors = ["Vyges"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/vyges-tools/gpl"
+
+# The chapter (src/gpl.md) and the CLI reference (src/reference/vyges-gpl.md) are written to drop
+# into the Vyges book unchanged, as engines/gpl.md and engines/reference/vyges-gpl.md.
