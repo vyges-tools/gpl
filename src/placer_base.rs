@@ -66,6 +66,12 @@ pub struct DbInst {
     pub halo: Option<Rect>,
     /// Its terminals that are not supply (`!getSigType().isSupply()`).
     pub signal_pins: usize,
+    /// `getOrient()` (`R0`, `R90`, … `MXR90`) and the master's width and height.
+    pub orient: String,
+    pub master_w: i32,
+    pub master_h: i32,
+    /// `isPlaced()` (PLACED, FIRM, LOCKED, COVER).
+    pub placed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -98,12 +104,21 @@ pub struct Port {
     pub bbox: Option<Rect>,
 }
 
+/// One instance terminal on a net: its instance (index into [`Design::insts`]) and the union of
+/// its master terminal's pin shapes, in master coordinates (`None` without shapes).
+#[derive(Debug, Clone)]
+pub struct Term {
+    pub inst: usize,
+    pub shape: Option<Rect>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DbNet {
     pub name: String,
     /// `SIGNAL` or `CLOCK` (the others are skipped).
     pub signal_or_clock: bool,
-    pub iterms: usize,
+    /// The net's terminals in `getITerms()` order.
+    pub iterms: Vec<Term>,
     pub bterms: Vec<Port>,
 }
 
@@ -303,7 +318,7 @@ pub fn placer_base_common(log: &mut Log, d: &Design, v: &Vars) -> Res<Common> {
         if !n.signal_or_clock {
             continue;
         }
-        let mut count = n.iterms;
+        let mut count = n.iterms.len();
         if !v.skip_io {
             for p in &n.bterms {
                 if p.bbox.is_none() && !v.place_ios {

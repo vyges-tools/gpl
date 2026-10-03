@@ -2,12 +2,12 @@
 //! `vyges-gpl <job.json>`: replays a job's steps — `read_db` (the design as the reference held it
 //! when `global_placement` ran), `set_debug_level`, then `global_placement` — and prints the run's
 //! output lines as JSON: `{"lines": [...], "stop": null | "error GPL-0130" | "refused: …",
-//! "outcome": "constructed"}`.
+//! "outcome": "initially_placed"}`, with `trace`: the raw-value probe lines.
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use vyges_gpl::log::{refuse, Log, Res, Stop};
-use vyges_gpl::placer_base::{Blockage, DbInst, DbNet, Design, Group, Port, Rect, Region};
+use vyges_gpl::placer_base::{Blockage, DbInst, DbNet, Design, Group, Port, Rect, Region, Term};
 use vyges_gpl::run::Outcome;
 use vyges_opendb::Db;
 
@@ -67,6 +67,10 @@ fn design(db: &Db) -> Res<Design> {
         }).count();
         let group = some(db.inst_get_group(&name)).map(|g| group_ix.get(&g).copied().ok_or_else(|| Stop::Refused(format!("{name}: group {g} not in the block")))).transpose()?;
         d.insts.push(DbInst {
+            orient: db.inst_get_orient(&name),
+            master_w: db.master_get_width(&master) as i32,
+            master_h: db.master_get_height(&master) as i32,
+            placed: db.inst_is_placed(&name),
             core_auto_placeable: db.master_is_core_auto_placeable(&master),
             master_is_block: db.master_is_block(&master),
             bbox: Rect { lx, ly, ux, uy },
@@ -78,8 +82,32 @@ fn design(db: &Db) -> Res<Design> {
             name,
         });
     }
+    let inst_ix: HashMap<String, usize> = d.insts.iter().enumerate().map(|(k, i)| (i.name.clone(), k)).collect();
+    // Each master terminal's pin box: the union of its pins' boxes.
+    let mut shapes: HashMap<(String, String), Option<Rect>> = HashMap::new();
     for name in db.block_get_nets() {
         let sig = db.net_get_sig_type(&name);
+        let mut iterms = Vec::new();
+        for t in db.net_get_i_terms(&name) {
+            let (i, p) = t.rsplit_once('/').unwrap_or(("", &t));
+            let k = *inst_ix.get(i).ok_or_else(|| Stop::Refused(format!("{t}: instance not in the block")))?;
+            let master = d.insts[k].master.clone();
+            let shape = *shapes.entry((master.clone(), p.to_string())).or_insert_with(|| {
+                let mut u: Option<Rect> = None;
+                for m in 0..db.num_mterm_get_m_pins(&master, p) {
+                    let r = Rect { lx: db.mpin_get_b_box_x_min(&master, p, m), ly: db.mpin_get_b_box_y_min(&master, p, m), ux: db.mpin_get_b_box_x_max(&master, p, m), uy: db.mpin_get_b_box_y_max(&master, p, m) };
+                    if r.lx > r.ux || r.ly > r.uy {
+                        continue;
+                    }
+                    u = Some(match u {
+                        None => r,
+                        Some(a) => Rect { lx: a.lx.min(r.lx), ly: a.ly.min(r.ly), ux: a.ux.max(r.ux), uy: a.uy.max(r.uy) },
+                    });
+                }
+                u
+            });
+            iterms.push(Term { inst: k, shape });
+        }
         let bterms = db
             .net_get_b_terms(&name)
             .into_iter()
@@ -88,7 +116,7 @@ fn design(db: &Db) -> Res<Design> {
                 Port { bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), name: b }
             })
             .collect();
-        d.nets.push(DbNet { signal_or_clock: sig == "SIGNAL" || sig == "CLOCK", iterms: db.net_get_i_term_count(&name) as usize, bterms, name });
+        d.nets.push(DbNet { signal_or_clock: sig == "SIGNAL" || sig == "CLOCK", iterms, bterms, name });
     }
     let boxes = db.blockage_boxes().map_err(e)?;
     for (k, (lx, ly, ux, uy)) in boxes.into_iter().enumerate() {
@@ -131,7 +159,7 @@ fn run(job: &Value) -> Result<Value, String> {
     let mut threads = vyges_gpl::run::Threads { asked: 1, cores: physical_core_count() };
     let mut log = Log::default();
     let finish = |log: Log, stop: Option<String>, extra: Value| {
-        let mut v = json!({"lines": log.lines, "stop": stop});
+        let mut v = json!({"lines": log.lines, "trace": log.trace, "stop": stop});
         if let (Some(o), Value::Object(x)) = (v.as_object_mut(), extra) {
             o.extend(x);
         }
@@ -167,8 +195,8 @@ fn run(job: &Value) -> Result<Value, String> {
         })();
         match r {
             Ok(None) => {}
-            Ok(Some(Outcome::Constructed(c, bases))) => {
-                let extra = json!({"outcome": "constructed", "insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins,
+            Ok(Some(Outcome::InitiallyPlaced(c, bases))) => {
+                let extra = json!({"outcome": "initially_placed", "insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins,
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 return Ok(finish(log, None, extra));
             }

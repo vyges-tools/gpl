@@ -2,11 +2,12 @@
 //! The command and its sequence: `global_placement` (the Tcl proc: its checks, in its order),
 //! then `Replace::doInitialPlace` — each stage its own function, in the reference's order.
 //!
-//! Modelled so far (slice 1): the placer's construction — `PlacerBaseCommon`, then one
-//! `PlacerBase` for the top level and one per region group. A run stops there
-//! ([`Outcome::Constructed`]): initial placement is slice 2.
+//! Modelled so far: the placer's construction (slice 1) — `PlacerBaseCommon`, then one
+//! `PlacerBase` for the top level and one per region group — and initial placement (slice 2). A
+//! run stops there ([`Outcome::InitiallyPlaced`]): Nesterov placement is slice 3.
 
 use crate::log::{refuse, Log, Res};
+use crate::initial_place::{self, IpVars};
 use crate::placer_base::{self, Base, Common, Design, Vars};
 use std::collections::BTreeMap;
 
@@ -26,12 +27,11 @@ const FLAGS: &[&str] = &[
     "-disable_pin_density_adjust", "-enable_routing_congestion",
 ];
 
-/// How a run ended.
+/// How a run ended: the placer built (its common data and each region's base, the top level
+/// first unless it had no movable instance) and initially placed; Nesterov placement is next.
 #[derive(Debug)]
 pub enum Outcome {
-    /// The placer built: its common data and each region's base (the top level first, unless it
-    /// had no movable instance).
-    Constructed(Common, Vec<Base>),
+    InitiallyPlaced(Common, Vec<Base>),
 }
 
 /// `sta::parse_key_args` then `check_argc_eq0`: exact keys and flags, else the first key, then
@@ -107,18 +107,32 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     // replace_initial_place_cmd: the options, then doInitialPlace.
     let int = |k: &str| -> Res<i32> { keys.get(k).map_or(Ok(0), |v| v.trim().parse::<i32>().or_else(|_| refuse(format!("{k} {v}: not an integer")))) };
     let vars = Vars { pad_left: int("-pad_left")?, pad_right: int("-pad_right")?, skip_io: flag("-skip_io"), place_ios: flag("-place_ios"), disable_pin_density_adjust: flag("-disable_pin_density_adjust") };
+    let mut ip = IpVars { force_center: flag("-force_center_initial_place"), ..IpVars::default() };
+    if flag("-skip_initial_place") {
+        ip.max_iter = 0;
+    }
+    if keys.contains_key("-initial_place_max_iter") {
+        ip.max_iter = int("-initial_place_max_iter")?.max(0) as usize;
+    }
+    if keys.contains_key("-initial_place_max_fanout") {
+        ip.max_fanout = int("-initial_place_max_fanout")?.max(0) as usize;
+    }
+    // `PlaceOptions::skipIo()`, applied after the keys: no initial placement either.
+    if flag("-skip_io") {
+        ip.max_iter = 0;
+    }
     // The thread count does not change construction; the message is the command's first line.
     let _threads = placement_threads(log, threads);
-    do_initial_place(log, d, &vars)
+    do_initial_place(log, d, &vars, &ip)
 }
 
 /// `Replace::doInitialPlace`, to the placer's construction.
-fn do_initial_place(log: &mut Log, d: &Design, v: &Vars) -> Res<Outcome> {
+fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars) -> Res<Outcome> {
     check_has_core_rows(log, d)?;
     if v.place_ios {
         return refuse("-place_ios (checkPlaceIosSupported: the die polygon) is not modelled");
     }
-    let common = placer_base::placer_base_common(log, d, v)?;
+    let mut common = placer_base::placer_base_common(log, d, v)?;
     let mut bases = vec![placer_base::placer_base(log, d, &common, None, true)?];
     for region in &d.regions {
         for &g in &region.groups {
@@ -129,7 +143,11 @@ fn do_initial_place(log: &mut Log, d: &Design, v: &Vars) -> Res<Outcome> {
         log.warn("GPL", 123, "No placeable instances in the top-level region. Removing it.");
         bases.remove(0);
     }
-    Ok(Outcome::Constructed(common, bases))
+    if d.regions.iter().any(|r| !r.groups.is_empty()) {
+        return refuse("initial placement with region groups is not modelled");
+    }
+    initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
+    Ok(Outcome::InitiallyPlaced(common, bases))
 }
 
 /// `checkHasCoreRows` (`dbHasCoreRows`: a row whose site is not a PAD site).

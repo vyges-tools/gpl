@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default)]
 pub struct Log {
     pub lines: Vec<String>,
+    /// Raw-value probe lines (`VYG…`), compared with an instrumented reference's; never output.
+    pub trace: Vec<String>,
     /// `set_debug_level <tool> <group> <level>`.
     pub debug: BTreeMap<(String, String), i32>,
 }
@@ -49,6 +51,11 @@ impl Log {
     /// `logger_->report`: the text alone.
     pub fn report(&mut self, msg: impl AsRef<str>) {
         self.push(msg.as_ref().to_string());
+    }
+
+    /// A raw-value probe line.
+    pub fn trace(&mut self, line: String) {
+        self.trace.push(line);
     }
 
     /// `debugPrint`'s check: the group's level is at least `level`.
