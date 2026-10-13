@@ -1,16 +1,16 @@
-# vyges loom gpl — CLI reference
+# vyges physical gpl — CLI reference
 
-_Generated from `vyges loom gpl --help` — this page is the tool's own output, verbatim._
+_Generated from `vyges physical gpl --help` — this page is the tool's own output, verbatim._
 
 ```text
-vyges loom gpl — global placement: the placer's view of the design (instances, nets, pins,
+vyges physical gpl — global placement: the placer's view of the design (instances, nets, pins,
 regions) and the initial placement (Nesterov placement is not modelled yet)
 
 USAGE:
-  vyges loom gpl global_placement <job.json> [-o FILE]
-  vyges loom gpl --describe
-  vyges loom gpl --help
-  vyges loom gpl --version
+  vyges physical gpl global_placement <job.json> [-o FILE]
+  vyges physical gpl --describe
+  vyges physical gpl --help
+  vyges physical gpl --version
 
 JOB FIELDS:
   steps        required — the commands in order, each {"cmd": ..., "args": [...]}:

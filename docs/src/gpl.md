@@ -1,8 +1,9 @@
 # vyges-gpl — global placement
 
-> **Part of the Vyges Loom suite.** Install once with `vyges install loom`, then run
-> `vyges loom gpl`. It's also a standalone `vyges-gpl` binary on your PATH (the integration
-> contract for flow authors).
+> **Physical construction — opt-in, and not part of `vyges install loom`.** Install the group with
+> `vyges install physical` (or just this engine with `vyges install gpl`), then run
+> `vyges physical gpl`. It is also a standalone `vyges-gpl` binary on your PATH, which is what the
+> dispatch calls and what a flow author targets directly.
 
 `vyges-gpl` answers: **where does each movable instance start?** It builds the placer's view of
 the design and runs the initial placement — and every coordinate it produces matches the

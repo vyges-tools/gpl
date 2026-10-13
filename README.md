@@ -8,9 +8,9 @@ full `global_placement` is refused after the initial placement, and `-skip_neste
 places the design.
 
 ```sh
-vyges install loom
-vyges loom gpl global_placement job.json
-vyges loom gpl --describe
+vyges install physical
+vyges physical gpl global_placement job.json
+vyges physical gpl --describe
 ```
 
 Documentation: [`docs/src/gpl.md`](docs/src/gpl.md) (an mdBook; `mdbook build docs`), with the
