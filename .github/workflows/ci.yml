@@ -29,22 +29,22 @@ jobs:
       run:
         working-directory: vyges-tools-gpl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: vyges-tools-gpl
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb
           path: vyges-tools-opendb
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb-lib
           path: vyges-tools-opendb-lib
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/loom
           path: vyges-tools-loom
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
@@ -64,22 +64,22 @@ jobs:
       run:
         working-directory: vyges-tools-gpl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: vyges-tools-gpl
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb
           path: vyges-tools-opendb
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb-lib
           path: vyges-tools-opendb-lib
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/loom
           path: vyges-tools-loom
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
