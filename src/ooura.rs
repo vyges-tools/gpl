@@ -3100,6 +3100,8 @@ mod tests {
             .collect()
     }
 
+    // Read only by the macOS bit-for-bit test below.
+    #[cfg(target_os = "macos")]
     fn fnv1a(v: &[f32]) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         for f in v {
