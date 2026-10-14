@@ -8,6 +8,7 @@
 
 use crate::log::{refuse, Log, Res};
 use crate::initial_place::{self, Ip, IpVars};
+use crate::nesterov;
 use crate::placer_base::{self, Base, Common, Design, Vars};
 use std::collections::BTreeMap;
 
@@ -34,6 +35,9 @@ pub enum Outcome {
     /// The placer, its bases, the initial placement's state (each database box as it left it), and
     /// whether the command stops there (`-skip_nesterov_place`).
     InitiallyPlaced(Common, Vec<Base>, Ip, bool),
+    /// Nesterov placement ran: the placer, its bases, each placed instance's database location
+    /// (design instance, lower-left) and the final iteration.
+    Placed(Common, Vec<Base>, Vec<(usize, i32, i32)>, i32),
 }
 
 /// `sta::parse_key_args` then `check_argc_eq0`: exact keys and flags, else the first key, then
@@ -125,7 +129,53 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     }
     // The thread count does not change construction; the message is the command's first line.
     let _threads = placement_threads(log, threads);
-    do_initial_place(log, d, &vars, &ip, flag("-skip_nesterov_place"))
+    let skip_nesterov = flag("-skip_nesterov_place");
+    // replace_nesterov_place_cmd's options, checked before any work so a refusal costs nothing.
+    let np = if skip_nesterov { None } else { Some(nesterov_opts(&keys, &flags, &vars)?) };
+    let outcome = do_initial_place(log, d, &vars, &ip, skip_nesterov)?;
+    match (outcome, np) {
+        (Outcome::InitiallyPlaced(mut c, bases, mut ip, false), Some(o)) => {
+            if bases.len() != 1 || bases[0].group.is_some() {
+                return refuse("Nesterov placement over more than the top-level region is not modelled");
+            }
+            let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases[0], &o)?;
+            let iter = nesterov::do_nesterov_place(log, d, &mut nb)?;
+            let locations = nesterov::placed_locations(&c, &nb);
+            Ok(Outcome::Placed(c, bases, locations, iter))
+        }
+        (other, _) => Ok(other),
+    }
+}
+
+/// `getOptions` for the plain Nesterov mode; the modes it does not model are refused.
+fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) -> Res<nesterov::Opts> {
+    for f in ["-timing_driven", "-timing_driven_repair_timing", "-routability_driven", "-virtual_cts", "-enable_routing_congestion"] {
+        if flags.iter().any(|x| x == f) {
+            return refuse(format!("global_placement {f} is not modelled"));
+        }
+    }
+    let float = |k: &str, d: f32| -> Res<f32> { keys.get(k).map_or(Ok(d), |s| s.trim().parse::<f32>().or_else(|_| refuse(format!("{k} {s}: not a number")))) };
+    let int = |k: &str, d: i32| -> Res<i32> { keys.get(k).map_or(Ok(d), |s| s.trim().parse::<i32>().or_else(|_| refuse(format!("{k} {s}: not an integer")))) };
+    let mut o = nesterov::Opts::default();
+    match keys.get("-density").map(String::as_str) {
+        Some("uniform") => o.uniform_density = true,
+        Some(_) => o.density = float("-density", 0.7)?,
+        None => {}
+    }
+    if keys.contains_key("-bin_grid_count") {
+        o.bin_cnt = Some(int("-bin_grid_count", 0)?);
+    }
+    o.init_density_penalty = float("-init_density_penalty", o.init_density_penalty)?;
+    o.init_wirelength_coef = float("-init_wirelength_coef", o.init_wirelength_coef)?;
+    o.min_phi_coef = float("-min_phi_coef", o.min_phi_coef)?;
+    o.max_phi_coef = float("-max_phi_coef", o.max_phi_coef)?;
+    o.overflow = float("-overflow", o.overflow)?;
+    o.reference_hpwl = float("-reference_hpwl", o.reference_hpwl)?;
+    o.seed = int("-random_seed", o.seed)?;
+    o.perturb_dist = float("-perturb_dist", o.perturb_dist)?;
+    o.disable_revert_if_diverge = flags.iter().any(|x| x == "-disable_revert_if_diverge");
+    o.pad_left = v.pad_left;
+    Ok(o)
 }
 
 /// `Replace::doInitialPlace`, to the placer's construction.

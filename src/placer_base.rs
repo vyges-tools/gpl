@@ -110,6 +110,8 @@ pub struct Port {
 pub struct Term {
     pub inst: usize,
     pub shape: Option<Rect>,
+    /// Its position among its instance's terminals (`dbInst::getITerms`: master terminal order).
+    pub order: usize,
 }
 
 #[derive(Debug, Clone)]

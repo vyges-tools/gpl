@@ -124,6 +124,22 @@ pub fn pins(d: &Design, c: &Common, v: &Vars) -> Ip {
         }
         ip.net_pins.push(list);
     }
+    // `Instance::pins_` follows the instance's own terminals (`dbInst::getITerms`), not the nets.
+    let mut order = vec![0usize; ip.pins.len()];
+    let mut k = 0;
+    for &(net, _) in &c.nets {
+        let n = &d.nets[net];
+        for t in &n.iterms {
+            order[k] = t.order;
+            k += 1;
+        }
+        if !v.skip_io {
+            k += n.bterms.len();
+        }
+    }
+    for pins in ip.inst_pins.iter_mut() {
+        pins.sort_by_key(|&p| order[p]);
+    }
     ip.place = c.insts.iter().enumerate().filter(|(_, i)| !i.fixed).map(|(k, _)| k).collect();
     ip
 }

@@ -85,6 +85,7 @@ fn design(db: &Db) -> Res<Design> {
     let inst_ix: HashMap<String, usize> = d.insts.iter().enumerate().map(|(k, i)| (i.name.clone(), k)).collect();
     // Each master terminal's pin box: the union of its pins' boxes.
     let mut shapes: HashMap<(String, String), Option<Rect>> = HashMap::new();
+    let mut mterm_order: HashMap<(String, String), usize> = HashMap::new();
     for name in db.block_get_nets() {
         let sig = db.net_get_sig_type(&name);
         let mut iterms = Vec::new();
@@ -106,7 +107,13 @@ fn design(db: &Db) -> Res<Design> {
                 }
                 u
             });
-            iterms.push(Term { inst: k, shape });
+            if !mterm_order.contains_key(&(master.clone(), p.to_string())) {
+                for (n, (m, _)) in db.master_mterms(&master).map_err(e)?.into_iter().enumerate() {
+                    mterm_order.insert((master.clone(), m), n);
+                }
+            }
+            let order = mterm_order.get(&(master.clone(), p.to_string())).copied().unwrap_or(usize::MAX);
+            iterms.push(Term { inst: k, shape, order });
         }
         let bterms = db
             .net_get_b_terms(&name)
@@ -229,6 +236,37 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 return Ok(finish(log, None, extra));
             }
+            Ok(Some(Outcome::Placed(c, bases, locations, iter))) => {
+                let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins, "nesterov_iterations": iter,
+                    "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
+                // `updateDbGCells`: each placed instance at its location, PLACED.
+                let db = db.as_mut().expect("read before global_placement");
+                let names = db.block_get_insts();
+                for &(di, x, y) in &locations {
+                    let e = |e: vyges_opendb::Error| format!("{}: {e}", names[di]);
+                    db.inst_set_placement_status(&names[di], "PLACED").map_err(e)?;
+                    db.set_inst_location(&names[di], x, y).map_err(e)?;
+                }
+                // `reportHpwlMetric` (GPL-1018): every non-supply, non-special net's terminal box.
+                let mut hpwl = 0i64;
+                for net in db.block_get_nets() {
+                    let sig = db.net_get_sig_type(&net);
+                    if matches!(sig.as_str(), "POWER" | "GROUND") || db.net_is_special(&net) {
+                        continue;
+                    }
+                    let (x0, y0, x1, y1) = (db.net_get_term_b_box_x_min(&net), db.net_get_term_b_box_y_min(&net), db.net_get_term_b_box_x_max(&net), db.net_get_term_b_box_y_max(&net));
+                    if x0 > x1 || y0 > y1 {
+                        continue;
+                    }
+                    hpwl += i64::from(x1 - x0) + i64::from(y1 - y0);
+                }
+                let dbu = f64::from(db.tech_get_db_units_per_micron());
+                log.info("GPL", 1018, format!("Final HPWL (um): {:.2}", hpwl as f64 / dbu));
+                if let Some(path) = job["write_def"].as_str() {
+                    db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
+                }
+                return Ok(finish(log, None, extra));
+            }
             Err(Stop::Error { tool, id }) => {
                 let mut v = finish(log, Some(format!("error: {tool}-{id:04}")), json!({}));
                 v["code"] = json!(format!("{tool}-{id:04}"));
@@ -243,7 +281,7 @@ fn run(job: &Value) -> Result<Value, String> {
 
 const USAGE: &str = "\
 vyges physical gpl — global placement: the placer's view of the design (instances, nets, pins,
-regions) and the initial placement (Nesterov placement is not modelled yet)
+regions), the initial placement, then the Nesterov electrostatic placement
 
 USAGE:
   vyges physical gpl global_placement <job.json> [-o FILE]
@@ -254,15 +292,16 @@ USAGE:
 JOB FIELDS:
   steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}:
                read_db, set_debug_level, set_thread_count, then global_placement [options]
-  write_def    with -skip_nesterov_place: write the placed design, as DEF, to this path
+  write_def    write the placed design, as DEF, to this path
 
 MODELLED:
-  the placer's construction (GPL-0001..0021, 0035..0037: instances, fixed ones snapped to
-  sites, padding, the pin-density area adjustment, nets and pins, unusable-site dummies), and the
-  initial placement — every bound-to-bound round and its [InitialPlace] line, the solver's
-  arithmetic in the reference's own operation order. With -skip_nesterov_place that is the
-  whole command (status placed); otherwise the command is refused after it
-  (modelled_through: initial_place). Refused: -incremental, -place_ios, region groups,
+  the placer's construction (GPL-0001..0021, 0035..0037), the initial placement (every
+  bound-to-bound round and its [InitialPlace] line), and the Nesterov placement: the fillers,
+  the pre-placement perturbation, the bin grid (GPL-0023..0030), the DCT density field, the
+  weighted-average wirelength gradient, the accelerated descent with back-tracking, every
+  progress row, convergence (GPL-1001..1009) and the final area and HPWL (GPL-1014, 1018) —
+  all in the reference's own operation order. Refused: -timing_driven, -routability_driven,
+  -virtual_cts, -enable_routing_congestion, -incremental, -place_ios, region groups,
   placement clusters.
 
 OPTIONS:
@@ -291,12 +330,12 @@ const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "gpl",
-  "summary": "global placement: the placer's construction and the bound-to-bound initial placement",
+  "summary": "global placement: the placer's construction, the bound-to-bound initial placement and the Nesterov (electrostatic density) placement",
   "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
-    "status is one of placed, vacuous, refused or error. placed means the design was initially placed and the command asked for no more (-skip_nesterov_place). A full global_placement is refused after the initial placement (modelled_through: initial_place). The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: the placer's construction and the initial placement, bit-exact against the reference. Refused rather than guessed: -incremental, -place_ios, region groups, placement clusters."
+    "status is one of placed, vacuous, refused or error. placed means the command ran to the end: the initial placement (and, unless -skip_nesterov_place, the Nesterov placement to the target overflow) written to the database. The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
+    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion, -incremental, -place_ios, region groups, placement clusters."
   ],
   "invocation": {
     "args_template": ["global_placement", "{job}"],

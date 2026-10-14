@@ -8,9 +8,14 @@
 //!   region.
 //! - [`initial_place`]: the bound-to-bound initial placement, solved by [`bicgstab`].
 //! - [`log`]: the output lines and how a run stops.
+//! - [`ooura`]: the 2-D cosine/sine transforms of the density solver.
 
 pub mod bicgstab;
 pub mod initial_place;
+pub mod ld;
 pub mod log;
+pub mod nesterov;
+pub mod normal;
+pub mod ooura;
 pub mod placer_base;
 pub mod run;
