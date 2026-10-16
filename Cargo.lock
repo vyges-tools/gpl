@@ -390,7 +390,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 [[package]]
 name = "vyges-events"
 version = "0.1.41"
-source = "git+https://github.com/vyges-tools/events?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
+source = "git+https://github.com/vyges-tools/events.git?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
 dependencies = [
  "serde",
  "serde_json",
@@ -406,6 +406,7 @@ name = "vyges-gpl"
 version = "0.1.41"
 dependencies = [
  "serde_json",
+ "vyges-events",
  "vyges-opendb",
 ]
 

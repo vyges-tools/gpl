@@ -377,6 +377,33 @@ fn exit_for(status: &str) -> u8 {
     }
 }
 
+/// The run's lines as structured events (`vyges-events/1.0`): each `[INFO|WARNING|ERROR TOOL-nnnn]
+/// text` line the reference's logger would print under its own code and severity, any other line
+/// (`report` text) as information; a refusal under `GPL-REFUSED`. The JSON report is unchanged.
+fn emit_events(report: &serde_json::Value) {
+    use vyges_events::{emit, Event, Severity};
+    for l in report["lines"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
+        let parsed = l.strip_prefix('[').and_then(|r| r.split_once("] ")).and_then(|(head, text)| head.split_once(' ').map(|(sev, code)| (sev, code, text)));
+        let ev = match parsed {
+            Some((sev, code, text)) => {
+                let severity = match sev {
+                    "ERROR" | "CRITICAL" => Severity::Error,
+                    "WARNING" => Severity::Warn,
+                    _ => Severity::Info,
+                };
+                Event::new("vyges-gpl", severity, text.to_string()).with_code(code)
+            }
+            None => Event::new("vyges-gpl", Severity::Info, l.to_string()),
+        };
+        emit(&ev);
+    }
+    if report["status"] == "refused" {
+        if let Some(why) = report["reason"].as_str() {
+            emit(&Event::new("vyges-gpl", Severity::Warn, why.to_string()).with_code("GPL-REFUSED"));
+        }
+    }
+}
+
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -437,6 +464,7 @@ fn main() -> std::process::ExitCode {
         },
     };
     let status = report["status"].as_str().unwrap_or("error").to_string();
+    emit_events(&report);
     let text = format!("{report}\n");
     match &out {
         Some(f) => {
