@@ -315,7 +315,7 @@ OPTIONS:
 
 THREADS:
   Runs on one thread; there is no thread option. A job's set_thread_count is read as the
-  reference reads it, but only decides the count the run reports (GPL-0190).
+  reference reads it, but only decides the thread count the run reports.
 
 EXIT STATUS:
   0  placed       -skip_nesterov_place: the design initially placed
@@ -357,7 +357,7 @@ const DESCRIBE: &str = r#"{
   "consumes": ["job"],
   "threads": {
     "parallel": false,
-    "guidance": "Runs on one thread; there is no thread option. A job's set_thread_count step is accepted as the reference accepts it, but only decides the count the run reports (GPL-0190), not the placement. Several runs can go side by side, one core each."
+    "guidance": "Runs on one thread; there is no thread option. A job's set_thread_count step is accepted as the reference accepts it, but only decides the thread count the run reports, not the placement. Several runs can go side by side, one core each."
   },
   "artifacts": [],
   "assertion": {

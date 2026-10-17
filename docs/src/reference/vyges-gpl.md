@@ -38,7 +38,7 @@ OPTIONS:
 
 THREADS:
   Runs on one thread; there is no thread option. A job's set_thread_count is read as the
-  reference reads it, but only decides the count the run reports (GPL-0190).
+  reference reads it, but only decides the thread count the run reports.
 
 EXIT STATUS:
   0  placed       -skip_nesterov_place: the design initially placed
