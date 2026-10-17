@@ -300,9 +300,9 @@ MODELLED:
   the pre-placement perturbation, the bin grid (GPL-0023..0030), the DCT density field, the
   weighted-average wirelength gradient, the accelerated descent with back-tracking, every
   progress row, convergence (GPL-1001..1009) and the final area and HPWL (GPL-1014, 1018) —
-  all in the reference's own operation order. Refused: -timing_driven, -routability_driven,
-  -virtual_cts, -enable_routing_congestion, -incremental, -place_ios, region groups,
-  placement clusters.
+  all in the reference's own operation order; region groups each their own Nesterov region
+  (GPL-1016). Refused: -timing_driven, -routability_driven, -virtual_cts,
+  -enable_routing_congestion, -incremental, -place_ios, placement clusters.
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout
@@ -339,7 +339,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of placed, vacuous, refused or error. placed means the command ran to the end: the initial placement (and, unless -skip_nesterov_place, the Nesterov placement to the target overflow) written to the database. The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion, -incremental, -place_ios, region groups, placement clusters."
+    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion, -incremental, -place_ios, placement clusters."
   ],
   "invocation": {
     "args_template": ["global_placement", "{job}"],

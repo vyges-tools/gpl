@@ -43,9 +43,14 @@ and a `status`:
   the pin-density area adjustment, signal and clock nets with their pins, regions, dummy
   instances over unusable sites;
 - the initial placement: start points, the bound-to-bound matrix for x and y, the solver with
-  its restart, the clamp to the core and region, the database written as the reference writes it.
+  its restart, the clamp to the core and region, the database written as the reference writes it;
+- the Nesterov (electrostatic) placement: fillers, the pre-placement perturbation, the bin grid,
+  the DCT density field, the weighted-average wirelength gradient, the accelerated descent with
+  back-tracking and the divergence revert — over the top level and every region group, each
+  region its own density field.
 
-Refused rather than guessed: `-incremental`, `-place_ios`, region groups, placement clusters.
+Refused rather than guessed: `-timing_driven`, `-routability_driven`, `-virtual_cts`,
+`-incremental`, `-place_ios`, placement clusters.
 
 ## Build
 

@@ -4,8 +4,10 @@
 //! Poisson solve, the weighted-average (WA) wirelength gradient, and the accelerated descent with
 //! back-tracking — in the reference's call sequence, each stage its own function.
 //!
-//! Scope: ONE region (the top level), no clusters, no IO-pin cells, no timing-driven or
-//! routability modes, no virtual CTS — the plain mode. Anything else is refused by the caller.
+//! Scope: the plain mode over the top level and every region group (`NesterovBaseCommon` shared,
+//! one `NesterovBase` per region, `NesterovPlace` looping over them) — no clusters, no IO-pin
+//! cells, no timing-driven or routability modes, no virtual CTS. Anything else is refused by the
+//! caller.
 //!
 //! ⛔ **Every value is the reference's type, and every expression its evaluation order.** The
 //! cells' coordinates, gradients, step length and penalty are `float`; several expressions mix in
@@ -394,16 +396,14 @@ impl Fft {
     }
 }
 
-/// The placer's whole Nesterov state: `NesterovBaseCommon`, the one `NesterovBase`, and
-/// `NesterovPlace`'s loop variables.
+/// One region's `NesterovBase`: its cells (indices into [`Nesterov::gcells`] — its placed
+/// instances in its placer base's order, then its own fillers), its bin grid and density field,
+/// and its descent state, every per-cell vector in `cells` order.
 #[derive(Debug, Clone)]
-pub struct Nesterov {
-    pub o: Opts,
-    pub gcells: Vec<GCell>,
-    pub gpins: Vec<GPin>,
-    pub gnets: Vec<GNet>,
-    /// Each pin's net (`GPin::getGNet`).
-    pin_net: Vec<usize>,
+pub struct Nb {
+    pub cells: Vec<usize>,
+    /// The region group's name; `None` for the top level.
+    pub group: Option<String>,
     pub bg: BinGrid,
     fft: Fft,
     pub filler_dx: i32,
@@ -417,7 +417,6 @@ pub struct Nesterov {
     non_place_insts_area: i64,
     max_phi_coef: f32,
     max_phi_coef_changed: bool,
-    // The slots, per cell in `gcells` order.
     cur_slp: Vec<FloatPoint>,
     cur_slp_wl: Vec<FloatPoint>,
     cur_slp_den: Vec<FloatPoint>,
@@ -453,6 +452,77 @@ pub struct Nesterov {
     coordi_distance: f32,
     is_converged: bool,
     is_diverged: bool,
+}
+
+impl Nb {
+    fn new(base: &Base, group: Option<String>, o: &Opts) -> Nb {
+        Nb {
+            cells: vec![],
+            group,
+            bg: BinGrid::default(),
+            fft: Fft::new(1, 1, 1.0, 1.0),
+            filler_dx: 0,
+            filler_dy: 0,
+            fillers: 0,
+            target_density: 0.0,
+            uniform_target_density: 0.0,
+            white_space_area: 0,
+            std_insts_area: base.std_insts_area,
+            macro_insts_area: base.macro_insts_area,
+            non_place_insts_area: base.non_place_insts_area,
+            max_phi_coef: o.max_phi_coef,
+            max_phi_coef_changed: false,
+            cur_slp: vec![],
+            cur_slp_wl: vec![],
+            cur_slp_den: vec![],
+            cur_slp_sum: vec![],
+            next_slp: vec![],
+            next_slp_wl: vec![],
+            next_slp_den: vec![],
+            next_slp_sum: vec![],
+            prev_slp: vec![],
+            prev_slp_wl: vec![],
+            prev_slp_den: vec![],
+            prev_slp_sum: vec![],
+            cur: vec![],
+            next: vec![],
+            snapshot: vec![],
+            snapshot_slp: vec![],
+            snapshot_slp_sum: vec![],
+            snapshot_prev_slp_sum: vec![],
+            snapshot_density_penalty: 0.0,
+            snapshot_step_length: 0.0,
+            step_length: 0.0,
+            density_penalty: 0.0,
+            wl_grad_sum: 0.0,
+            density_grad_sum: 0.0,
+            sum_overflow: 0.0,
+            sum_overflow_unscaled: 0.0,
+            base_wl_coef_nb: 0.0,
+            prev_hpwl: 0,
+            prev_reported_hpwl: 0,
+            prev_reported_overflow_unscaled: 0.0,
+            min_sum_overflow: 1e30,
+            hpwl_with_min_sum_overflow: 1e30,
+            coordi_distance: 0.0,
+            is_converged: false,
+            is_diverged: false,
+        }
+    }
+}
+
+/// The placer's whole Nesterov state: `NesterovBaseCommon` (every placed instance's cell, the pins
+/// and nets — then each region's fillers, appended), the regions' `NesterovBase`s, and
+/// `NesterovPlace`'s loop variables.
+#[derive(Debug, Clone)]
+pub struct Nesterov {
+    pub o: Opts,
+    pub gcells: Vec<GCell>,
+    pub gpins: Vec<GPin>,
+    pub gnets: Vec<GNet>,
+    /// Each pin's net (`GPin::getGNet`).
+    pin_net: Vec<usize>,
+    pub nbs: Vec<Nb>,
     // NesterovPlace.
     wl_coef_x: f32,
     wl_coef_y: f32,
@@ -506,10 +576,10 @@ fn dbu_area(d: &Design, a: f64) -> f64 {
     a / (f64::from(d.dbu) * f64::from(d.dbu))
 }
 
-/// `NesterovBaseCommon` then the top level's `NesterovBase` (`Replace::initNesterovPlace`, up to
-/// the placer): cells, pins and nets, the fillers, the perturbation, the bin grid, the FFT, the
-/// density sizes.
-pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, o: &Opts) -> Res<Nesterov> {
+/// `NesterovBaseCommon` then each placer base's `NesterovBase` (`Replace::initNesterovPlace`, up
+/// to the placer): one cell per placed instance of the whole design, pins and nets; then per
+/// region its fillers, its perturbation, its bin grid, its FFT, its density sizes.
+pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, bases: &[Base], o: &Opts) -> Res<Nesterov> {
     // NesterovBaseCommon: one cell per placed instance, pins and nets as the placer holds them.
     let mut gcells: Vec<GCell> = Vec::new();
     let mut inst_cell = vec![None; c.insts.len()];
@@ -531,64 +601,17 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
             pin_net[p] = n;
         }
     }
-    // The NesterovBase holds this region's placed instances in its own order, then fillers.
-    if base.place_insts != ip.place {
-        return refuse("a top-level placer region whose instances differ from the common set is not modelled");
+    // Every base's placed instances are cells of the common set (`pbToNb`).
+    if bases.iter().any(|b| b.place_insts.iter().any(|&k| inst_cell[k].is_none())) {
+        return refuse("a placer region holding an instance outside the common placed set is not modelled");
     }
-    let mut nb = Nesterov {
+    let mut np = Nesterov {
         o: o.clone(),
         gcells,
         gpins,
         gnets,
         pin_net,
-        bg: BinGrid::default(),
-        fft: Fft::new(1, 1, 1.0, 1.0),
-        filler_dx: 0,
-        filler_dy: 0,
-        fillers: 0,
-        target_density: 0.0,
-        uniform_target_density: 0.0,
-        white_space_area: 0,
-        std_insts_area: base.std_insts_area,
-        macro_insts_area: base.macro_insts_area,
-        non_place_insts_area: base.non_place_insts_area,
-        max_phi_coef: o.max_phi_coef,
-        max_phi_coef_changed: false,
-        cur_slp: vec![],
-        cur_slp_wl: vec![],
-        cur_slp_den: vec![],
-        cur_slp_sum: vec![],
-        next_slp: vec![],
-        next_slp_wl: vec![],
-        next_slp_den: vec![],
-        next_slp_sum: vec![],
-        prev_slp: vec![],
-        prev_slp_wl: vec![],
-        prev_slp_den: vec![],
-        prev_slp_sum: vec![],
-        cur: vec![],
-        next: vec![],
-        snapshot: vec![],
-        snapshot_slp: vec![],
-        snapshot_slp_sum: vec![],
-        snapshot_prev_slp_sum: vec![],
-        snapshot_density_penalty: 0.0,
-        snapshot_step_length: 0.0,
-        step_length: 0.0,
-        density_penalty: 0.0,
-        wl_grad_sum: 0.0,
-        density_grad_sum: 0.0,
-        sum_overflow: 0.0,
-        sum_overflow_unscaled: 0.0,
-        base_wl_coef_nb: 0.0,
-        prev_hpwl: 0,
-        prev_reported_hpwl: 0,
-        prev_reported_overflow_unscaled: 0.0,
-        min_sum_overflow: 1e30,
-        hpwl_with_min_sum_overflow: 1e30,
-        coordi_distance: 0.0,
-        is_converged: false,
-        is_diverged: false,
+        nbs: Vec::new(),
         wl_coef_x: 0.0,
         wl_coef_y: 0.0,
         base_wl_coef: 0.0,
@@ -606,34 +629,45 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         num_region_diverged: 0,
         diverge: None,
     };
-    nesterov_base(log, d, c, ip, base, &mut nb)?;
-    Ok(nb)
+    for base in bases {
+        let nb = nesterov_base(log, d, c, ip, base, &inst_cell, &mut np)?;
+        np.nbs.push(nb);
+    }
+    Ok(np)
 }
 
-/// `NesterovBase::NesterovBase`.
-fn nesterov_base(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, nb: &mut Nesterov) -> Res<()> {
-    log.info("GPL", 33, "---- Initialize Nesterov Region: Top-level");
-    let fillers = init_filler_gcells(log, d, c, base, nb)?;
-    perturb_place_insts(d, c, ip, nb);
+/// `NesterovBase::NesterovBase`: the fillers first (their size from this region's instances),
+/// then the region's instances perturbed in its own order with its own generator, its cells (the
+/// instances, then the fillers), the bin grid over the region, the FFT, the density sizes.
+fn nesterov_base(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, inst_cell: &[Option<usize>], np: &mut Nesterov) -> Res<Nb> {
+    let group = base.group.map(|g| d.groups[g].name.clone());
+    log.info("GPL", 33, format!("---- Initialize Nesterov Region: {}", group.as_deref().unwrap_or("Top-level")));
+    let mut nb = Nb::new(base, group, &np.o);
+    let fillers = init_filler_gcells(log, d, c, base, &mut nb, &np.o)?;
+    perturb_place_insts(d, c, ip, base, inst_cell, &mut np.gcells, &np.o);
     nb.fillers = fillers.len();
-    nb.gcells.extend(fillers);
-    init_bins(log, d, c, base, nb);
+    nb.cells = base.place_insts.iter().map(|&k| inst_cell[k].expect("checked")).collect();
+    for f in fillers {
+        nb.cells.push(np.gcells.len());
+        np.gcells.push(f);
+    }
+    init_bins(log, d, c, base, &mut nb, &np.o);
     nb.fft = Fft::new(nb.bg.cnt_x, nb.bg.cnt_y, nb.bg.size_x as f32, nb.bg.size_y as f32);
-    update_density_size(nb);
-    probe_init(log, nb);
-    Ok(())
+    update_density_size(&mut np.gcells, &nb);
+    probe_init(log, &np.gcells, &nb);
+    Ok(nb)
 }
 
 /// `NesterovBase::getNesterovInstsArea`: standard cells, plus macros scaled by the target density
 /// (`round` of a float).
-fn nesterov_insts_area(nb: &Nesterov) -> i64 {
+fn nesterov_insts_area(nb: &Nb) -> i64 {
     nb.std_insts_area + (nb.macro_insts_area as f32 * nb.target_density).round() as i64
 }
 
 /// `initFillerGCells`: the filler size (the mean instance size between the 5th and 95th
 /// percentiles of each dimension), the target density, the filler area and count, and the
 /// fillers themselves at `mt19937(0)` positions inside the region.
-fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &mut Nesterov) -> Res<Vec<GCell>> {
+fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &mut Nb, o: &Opts) -> Res<Vec<GCell>> {
     let mut dxs: Vec<i32> = base.place_insts.iter().map(|&k| c.insts[k].dx()).collect();
     let mut dys: Vec<i32> = base.place_insts.iter().map(|&k| c.insts[k].dy()).collect();
     dxs.sort_unstable();
@@ -656,7 +690,7 @@ fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &m
     nb.filler_dy = (sy / i64::from(hi - lo)) as i32;
     nb.white_space_area = base.region_area - base.non_place_insts_area;
     let tmp_target = (f64::from(nb.std_insts_area as f32 / (nb.white_space_area - nb.macro_insts_area) as f32) + 0.01) as f32;
-    nb.target_density = if nb.o.uniform_density { tmp_target } else { nb.o.density };
+    nb.target_density = if o.uniform_density { tmp_target } else { o.density };
     let nia = nesterov_insts_area(nb);
     let mut movable = (nb.white_space_area as f32 * nb.target_density) as i64;
     let mut total_filler = movable - nia;
@@ -696,17 +730,18 @@ fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &m
     Ok(fillers)
 }
 
-/// The constructor's perturbation (`calculatePlacementPerturbationOffset` per placed instance, in
-/// order): two draws of a normal with σ = 0.3072 · r, r the given distance (scaled by DBU/1000) or
-/// min(half a micron, a row); each rounded; the instance and its pins moved, its cell rebuilt.
-/// A distance of exactly 0, or no row height, draws nothing.
-fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, nb: &mut Nesterov) {
-    let dist = nb.o.perturb_dist;
+/// The constructor's perturbation (`calculatePlacementPerturbationOffset` per placed instance of
+/// the region, in its order, with the region's own generator): two draws of a normal with
+/// σ = 0.3072 · r, r the given distance (scaled by DBU/1000) or min(half a micron, a row); each
+/// rounded; the instance and its pins moved, its cell rebuilt. A distance of exactly 0, or no row
+/// height, draws nothing.
+fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, inst_cell: &[Option<usize>], gcells: &mut [GCell], o: &Opts) {
+    let dist = o.perturb_dist;
     let draws = c.site_y > 0 && dist != 0.0;
     let r = if dist > 0.0 { f64::from(dist) * (f64::from(d.dbu) / 1000.0) } else { (0.5 * f64::from(d.dbu)).min(f64::from(c.site_y)) };
     let sigma = r * 0.3071963263271184;
-    let mut rng = Mt19937::new(nb.o.seed as u32);
-    for (g, &k) in ip.place.clone().iter().enumerate() {
+    let mut rng = Mt19937::new(o.seed as u32);
+    for &k in &base.place_insts {
         let (xo, yo) = if draws {
             let dx = normal(&mut rng, 0.0, sigma);
             let dy = normal(&mut rng, 0.0, sigma);
@@ -728,7 +763,7 @@ fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, nb: &mut Nestero
         }
         // `GCell::updateLocations` (one instance): the box, density box the same.
         let i = &c.insts[k];
-        let cell = &mut nb.gcells[g];
+        let cell = &mut gcells[inst_cell[k].expect("a placed instance")];
         cell.lx = i.lx;
         cell.ly = i.ly;
         cell.ux = i.ux;
@@ -742,7 +777,7 @@ fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, nb: &mut Nestero
 
 /// `BinGrid::initBins`: the bin count (a power of two per side, scaled by the aspect ratio, so that
 /// a bin holds about one average instance at the target density), the bins, their fixed area.
-fn init_bins(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &mut Nesterov) {
+fn init_bins(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &mut Nb, o: &Opts) {
     let r = base.region_bbox;
     let mut bg = BinGrid { lx: r.lx, ly: r.ly, ux: r.ux, uy: r.uy, ..BinGrid::default() };
     let total_bin_area = i64::from(r.ux - r.lx) * i64::from(r.uy - r.ly);
@@ -759,7 +794,7 @@ fn init_bins(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &mut Nester
     log.info("GPL", 25, format!("Ideal bin area:             {:10.3} um^2", dbu_area(d, ideal_bin_area as f64)));
     log.info("GPL", 26, format!("Ideal bin count:            {ideal_cnt:10}"));
     log.info("GPL", 27, format!("Total bin area:             {:10.3} um^2", dbu_area(d, total_bin_area as f64)));
-    match nb.o.bin_cnt {
+    match o.bin_cnt {
         Some(n) => {
             bg.cnt_x = n;
             bg.cnt_y = n;
@@ -866,7 +901,7 @@ fn overlap_area(b: &Bin, i: &crate::placer_base::Instance, dbu: i32) -> i64 {
 /// `BinGrid::updateBinsNonPlaceArea`: each bin's fixed area — the union of the fixed instances in
 /// it (unscaled), and their per-instance areas scaled by the target density, capped at 1.10 times
 /// the scaled union.
-fn update_bins_non_place_area(c: &Common, base: &Base, nb: &mut Nesterov, dbu: i32) {
+fn update_bins_non_place_area(c: &Common, base: &Base, nb: &mut Nb, dbu: i32) {
     let fixed: Vec<crate::placer_base::Instance> = base.fixed_insts.iter().map(|&k| c.insts[k].clone()).chain(base.dummies.iter().cloned()).collect();
     let bg = &mut nb.bg;
     for b in bg.bins.iter_mut() {
@@ -930,15 +965,16 @@ fn update_bins_non_place_area(c: &Common, base: &Base, nb: &mut Nesterov, dbu: i
     }
 }
 
-/// `NesterovBase::updateDensitySize`: a cell narrower than √2 bins is spread to √2 bins with its
-/// density scaled down to match (the comparison and the size in extended precision).
-fn update_density_size(nb: &mut Nesterov) {
+/// `NesterovBase::updateDensitySize`: a cell of the region narrower than √2 bins is spread to √2
+/// bins with its density scaled down to match (the comparison and the size in extended precision).
+fn update_density_size(gcells: &mut [GCell], nb: &Nb) {
     let (bsx, bsy) = (nb.bg.size_x, nb.bg.size_y);
     let thr_x = ld::SQRT2.times(Ld::from_f64(bsx));
     let thr_y = ld::SQRT2.times(Ld::from_f64(bsy));
     let size_x = ld::SQRT2.times(Ld::from_f32(bsx as f32)).to_f32();
     let size_y = ld::SQRT2.times(Ld::from_f32(bsy as f32)).to_f32();
-    for g in nb.gcells.iter_mut() {
+    for &gi in &nb.cells {
+        let g = &mut gcells[gi];
         let (dx, dy) = (g.dx(), g.dy());
         let (scale_x, dsx) = if Ld::from_u64(dx as u64) < thr_x { (dx as f32 / thr_x.to_f32(), size_x) } else { (1.0, dx as f32) };
         let (scale_y, dsy) = if Ld::from_u64(dy as u64) < thr_y { (dy as f32 / thr_y.to_f32(), size_y) } else { (1.0, dy as f32) };
@@ -948,9 +984,9 @@ fn update_density_size(nb: &mut Nesterov) {
 }
 
 /// `vygDump("INIT")`: the bin grid, the fillers and every cell as the constructor leaves them.
-fn probe_init(log: &mut Log, nb: &Nesterov) {
+fn probe_init(log: &mut Log, gcells: &[GCell], nb: &Nb) {
     let (mut hb, mut hd, mut hs, mut hg, mut hn) = (FNV0, FNV0, FNV0, FNV0, FNV0);
-    for g in &nb.gcells {
+    for g in nb.cells.iter().map(|&gi| &gcells[gi]) {
         for v in [g.lx, g.ly, g.ux, g.uy] {
             hb = fnv(&v.to_le_bytes(), hb);
         }
@@ -1025,90 +1061,96 @@ fn fmt_g(v: f64) -> String {
         strip(format!("{v:.decimals$}"))
     }
 }
-
 impl Nesterov {
-    /// `GCell::setDensityCenterLocation` with its pins (`GPin::updateDensityLocation`).
-    fn set_density_center(&mut self, i: usize, cx: i32, cy: i32) {
-        let g = &mut self.gcells[i];
+    /// `GCell::setDensityCenterLocation` with its pins (`GPin::updateDensityLocation`) — region
+    /// `b`'s cell `i`.
+    fn set_density_center(&mut self, b: usize, i: usize, cx: i32, cy: i32) {
+        let gi = self.nbs[b].cells[i];
+        let g = &mut self.gcells[gi];
         let (hx, hy) = (g.d_dx() / 2, g.d_dy() / 2);
         g.dlx = cx - hx;
         g.dly = cy - hy;
         g.dux = cx + hx;
         g.duy = cy + hy;
         let (dcx, dcy) = (g.d_cx(), g.d_cy());
-        for k in 0..self.gcells[i].pins.len() {
-            let p = self.gcells[i].pins[k];
+        for k in 0..self.gcells[gi].pins.len() {
+            let p = self.gcells[gi].pins[k];
             self.gpins[p].cx = dcx + self.gpins[p].off_x;
             self.gpins[p].cy = dcy + self.gpins[p].off_y;
         }
     }
 
     /// `GCell::setDensityLocation` with its pins.
-    fn set_density_location(&mut self, i: usize, lx: i32, ly: i32) {
-        let g = &mut self.gcells[i];
+    fn set_density_location(&mut self, b: usize, i: usize, lx: i32, ly: i32) {
+        let gi = self.nbs[b].cells[i];
+        let g = &mut self.gcells[gi];
         g.dux = lx + (g.dux - g.dlx);
         g.duy = ly + (g.duy - g.dly);
         g.dlx = lx;
         g.dly = ly;
         let (dcx, dcy) = (g.d_cx(), g.d_cy());
-        for k in 0..self.gcells[i].pins.len() {
-            let p = self.gcells[i].pins[k];
+        for k in 0..self.gcells[gi].pins.len() {
+            let p = self.gcells[gi].pins[k];
             self.gpins[p].cx = dcx + self.gpins[p].off_x;
             self.gpins[p].cy = dcy + self.gpins[p].off_y;
         }
     }
 
-    /// `updateDensityCoordiLayoutInside`: the density box moved inside the grid (float limits,
-    /// truncated back to the integer box).
-    fn update_density_coordi_layout_inside(&mut self, i: usize) {
-        let g = &self.gcells[i];
-        let mut tlx = (g.dlx as f32).max(self.bg.lx as f32);
-        let mut tly = (g.dly as f32).max(self.bg.ly as f32);
-        if tlx + g.d_dx() as f32 > self.bg.ux as f32 {
-            tlx = (self.bg.ux - g.d_dx()) as f32;
+    /// `updateDensityCoordiLayoutInside`: the density box moved inside the region's grid (float
+    /// limits, truncated back to the integer box).
+    fn update_density_coordi_layout_inside(&mut self, b: usize, i: usize) {
+        let bg = &self.nbs[b].bg;
+        let g = &self.gcells[self.nbs[b].cells[i]];
+        let mut tlx = (g.dlx as f32).max(bg.lx as f32);
+        let mut tly = (g.dly as f32).max(bg.ly as f32);
+        if tlx + g.d_dx() as f32 > bg.ux as f32 {
+            tlx = (bg.ux - g.d_dx()) as f32;
         }
-        if tly + g.d_dy() as f32 > self.bg.uy as f32 {
-            tly = (self.bg.uy - g.d_dy()) as f32;
+        if tly + g.d_dy() as f32 > bg.uy as f32 {
+            tly = (bg.uy - g.d_dy()) as f32;
         }
-        self.set_density_location(i, tlx as i32, tly as i32);
+        self.set_density_location(b, i, tlx as i32, tly as i32);
     }
 
     /// `getDensityCoordiLayoutInsideX`.
-    fn inside_x(&self, i: usize, cx: f32) -> f32 {
-        let half = self.gcells[i].d_dx() as f32 / 2.0f32;
+    fn inside_x(&self, b: usize, i: usize, cx: f32) -> f32 {
+        let bg = &self.nbs[b].bg;
+        let half = self.gcells[self.nbs[b].cells[i]].d_dx() as f32 / 2.0f32;
         let mut adj = cx;
-        if cx - half < self.bg.lx as f32 {
-            adj = self.bg.lx as f32 + half;
+        if cx - half < bg.lx as f32 {
+            adj = bg.lx as f32 + half;
         }
-        if cx + half > self.bg.ux as f32 {
-            adj = self.bg.ux as f32 - half;
+        if cx + half > bg.ux as f32 {
+            adj = bg.ux as f32 - half;
         }
         adj
     }
 
     /// `getDensityCoordiLayoutInsideY`.
-    fn inside_y(&self, i: usize, cy: f32) -> f32 {
-        let half = self.gcells[i].d_dy() as f32 / 2.0f32;
+    fn inside_y(&self, b: usize, i: usize, cy: f32) -> f32 {
+        let bg = &self.nbs[b].bg;
+        let half = self.gcells[self.nbs[b].cells[i]].d_dy() as f32 / 2.0f32;
         let mut adj = cy;
-        if cy - half < self.bg.ly as f32 {
-            adj = self.bg.ly as f32 + half;
+        if cy - half < bg.ly as f32 {
+            adj = bg.ly as f32 + half;
         }
-        if cy + half > self.bg.uy as f32 {
-            adj = self.bg.uy as f32 - half;
+        if cy + half > bg.uy as f32 {
+            adj = bg.uy as f32 - half;
         }
         adj
     }
 
-    /// `BinGrid::updateBinsGCellDensityArea`: each cell's density box scattered into the bins
-    /// (integer accumulators, truncated addends), then per bin, in order, the density and the
-    /// overflow — accumulated into an integer through a float, as the reference's `+=` does.
-    fn update_bins_gcell_density_area(&mut self) {
-        let bg = &mut self.bg;
-        for b in bg.bins.iter_mut() {
-            b.inst_placed_unscaled = 0;
-            b.filler = 0;
+    /// `BinGrid::updateBinsGCellDensityArea`: each of the region's cells' density box scattered
+    /// into its bins (integer accumulators, truncated addends), then per bin, in order, the density
+    /// and the overflow — accumulated into an integer through a float, as the reference's `+=` does.
+    fn update_bins_gcell_density_area(&mut self, b: usize) {
+        let gcells = &self.gcells;
+        let Nb { cells, bg, .. } = &mut self.nbs[b];
+        for bin in bg.bins.iter_mut() {
+            bin.inst_placed_unscaled = 0;
+            bin.filler = 0;
         }
-        for g in &self.gcells {
+        for g in cells.iter().map(|&gi| &gcells[gi]) {
             let (x0, x1) = bg.density_idx_x(g);
             let (y0, y1) = bg.density_idx_y(g);
             if g.is_instance() {
@@ -1118,58 +1160,59 @@ impl Nesterov {
                 }
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        let b = &mut bg.bins[(y * bg.cnt_x + x) as usize];
-                        let mut a = overlap_density_area(b, g) * g.density_scale;
+                        let bin = &mut bg.bins[(y * bg.cnt_x + x) as usize];
+                        let mut a = overlap_density_area(bin, g) * g.density_scale;
                         if macro_ {
-                            a *= b.target_density;
+                            a *= bin.target_density;
                         }
-                        b.inst_placed_unscaled += a as i64;
+                        bin.inst_placed_unscaled += a as i64;
                     }
                 }
             } else {
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        let b = &mut bg.bins[(y * bg.cnt_x + x) as usize];
-                        b.filler += (overlap_density_area(b, g) * g.density_scale) as i64;
+                        let bin = &mut bg.bins[(y * bg.cnt_x + x) as usize];
+                        bin.filler += (overlap_density_area(bin, g) * g.density_scale) as i64;
                     }
                 }
             }
         }
         bg.overflow = 0;
         bg.overflow_unscaled = 0;
-        for b in bg.bins.iter_mut() {
-            b.inst_placed = b.inst_placed_unscaled;
-            let scaled = b.area() as f32 * b.target_density;
-            b.density = (b.inst_placed as f32 + b.filler as f32 + b.non_place as f32) / scaled;
-            let o = 0.0f32.max(b.inst_placed as f32 + b.non_place as f32 - scaled);
+        for bin in bg.bins.iter_mut() {
+            bin.inst_placed = bin.inst_placed_unscaled;
+            let scaled = bin.area() as f32 * bin.target_density;
+            bin.density = (bin.inst_placed as f32 + bin.filler as f32 + bin.non_place as f32) / scaled;
+            let o = 0.0f32.max(bin.inst_placed as f32 + bin.non_place as f32 - scaled);
             bg.overflow = (bg.overflow as f32 + o) as i64;
-            let ou = 0.0f32.max(b.inst_placed_unscaled as f32 + b.non_place_unscaled as f32 - scaled);
+            let ou = 0.0f32.max(bin.inst_placed_unscaled as f32 + bin.non_place_unscaled as f32 - scaled);
             bg.overflow_unscaled = (bg.overflow_unscaled as f32 + ou) as i64;
         }
     }
 
     /// `updateGCellDensityCenterLocation`: every cell's density centre (truncated), then the bins.
-    fn update_gcell_density_center_location(&mut self, coords: &[FloatPoint]) {
+    fn update_gcell_density_center_location(&mut self, b: usize, coords: &[FloatPoint]) {
         for (i, c) in coords.iter().enumerate() {
-            self.set_density_center(i, c.x as i32, c.y as i32);
+            self.set_density_center(b, i, c.x as i32, c.y as i32);
         }
-        self.update_bins_gcell_density_area();
+        self.update_bins_gcell_density_area(b);
     }
 
     /// `updateDensityFieldBin`: the bins' densities through the solver, back as potential and field.
-    fn update_density_field_bin(&mut self) {
-        let ny = self.bg.cnt_y as usize;
-        let cnt_x = self.bg.cnt_x as usize;
-        for (k, b) in self.bg.bins.iter().enumerate() {
+    fn update_density_field_bin(&mut self, b: usize) {
+        let Nb { bg, fft, .. } = &mut self.nbs[b];
+        let ny = bg.cnt_y as usize;
+        let cnt_x = bg.cnt_x as usize;
+        for (k, bin) in bg.bins.iter().enumerate() {
             let (x, y) = (k % cnt_x, k / cnt_x);
-            self.fft.density[x * ny + y] = b.density;
+            fft.density[x * ny + y] = bin.density;
         }
-        self.fft.solve();
-        for (k, b) in self.bg.bins.iter_mut().enumerate() {
+        fft.solve();
+        for (k, bin) in bg.bins.iter_mut().enumerate() {
             let (x, y) = (k % cnt_x, k / cnt_x);
-            b.field_x = self.fft.field_x[x * ny + y];
-            b.field_y = self.fft.field_y[x * ny + y];
-            b.phi = self.fft.phi[x * ny + y];
+            bin.field_x = fft.field_x[x * ny + y];
+            bin.field_y = fft.field_y[x * ny + y];
+            bin.phi = fft.phi[x * ny + y];
         }
     }
 
@@ -1293,10 +1336,11 @@ impl Nesterov {
         FloatPoint::new(gmin_x - gmax_x, gmin_y - gmax_y)
     }
 
-    /// `getWireLengthGradientWA`: the cell's pins in order, each weighted by its net.
-    fn wl_gradient(&self, i: usize, pin_net: &[usize]) -> FloatPoint {
+    /// `getWireLengthGradientWA`: the cell's pins in order, each weighted by its net (`gi`: the
+    /// cell in the common store).
+    fn wl_gradient(&self, gi: usize, pin_net: &[usize]) -> FloatPoint {
         let mut s = FloatPoint::default();
-        for &p in &self.gcells[i].pins {
+        for &p in &self.gcells[gi].pins {
             let n = pin_net[p];
             let mut t = self.wl_gradient_pin(p, n);
             let w = self.gnets[n].total_weight();
@@ -1308,19 +1352,20 @@ impl Nesterov {
         s
     }
 
-    /// `getDensityGradient`: the field over the bins the density box covers (x outer, y inner),
-    /// weighted by the scaled overlap.
-    fn density_gradient(&self, i: usize) -> FloatPoint {
-        let g = &self.gcells[i];
-        let (x0, x1) = self.bg.density_idx_x(g);
-        let (y0, y1) = self.bg.density_idx_y(g);
+    /// `getDensityGradient`: the field over the region's bins the density box covers (x outer,
+    /// y inner), weighted by the scaled overlap.
+    fn density_gradient(&self, b: usize, i: usize) -> FloatPoint {
+        let bg = &self.nbs[b].bg;
+        let g = &self.gcells[self.nbs[b].cells[i]];
+        let (x0, x1) = bg.density_idx_x(g);
+        let (y0, y1) = bg.density_idx_y(g);
         let mut f = FloatPoint::default();
         for x in x0..x1 {
             for y in y0..y1 {
-                let b = &self.bg.bins[(y * self.bg.cnt_x + x) as usize];
-                let a = overlap_density_area(b, g) * g.density_scale;
-                f.x += a * b.field_x;
-                f.y += a * b.field_y;
+                let bin = &bg.bins[(y * bg.cnt_x + x) as usize];
+                let a = overlap_density_area(bin, g) * g.density_scale;
+                f.x += a * bin.field_x;
+                f.y += a * bin.field_y;
             }
         }
         f
@@ -1330,25 +1375,23 @@ impl Nesterov {
 impl Nesterov {
     /// `NesterovBase::updateGradients` into one slot: every cell's WA and density gradient, the
     /// preconditioned sum, then (serially, in cell order) the two absolute sums.
-    fn update_gradients(&mut self, slot: Slot) {
-        if self.is_converged {
+    fn update_gradients(&mut self, b: usize, slot: Slot) {
+        if self.nbs[b].is_converged {
             return;
         }
-        self.wl_grad_sum = 0.0;
-        self.density_grad_sum = 0.0;
-        let n = self.gcells.len();
+        let n = self.nbs[b].cells.len();
         let mut wl = vec![FloatPoint::default(); n];
         let mut den = vec![FloatPoint::default(); n];
         let mut sum = vec![FloatPoint::default(); n];
         for i in 0..n {
-            wl[i] = self.wl_gradient(i, &self.pin_net);
+            wl[i] = self.wl_gradient(self.nbs[b].cells[i], &self.pin_net);
         }
         for i in 0..n {
-            den[i] = self.density_gradient(i);
+            den[i] = self.density_gradient(b, i);
         }
-        let p = self.density_penalty;
+        let p = self.nbs[b].density_penalty;
         for i in 0..n {
-            let g = &self.gcells[i];
+            let g = &self.gcells[self.nbs[b].cells[i]];
             sum[i].x = wl[i].x + p * den[i].x;
             sum[i].y = wl[i].y + p * den[i].y;
             let wl_pre = g.pins.len() as f32;
@@ -1358,46 +1401,50 @@ impl Nesterov {
             sum[i].x /= pre_x;
             sum[i].y /= pre_y;
         }
+        let nb = &mut self.nbs[b];
+        nb.wl_grad_sum = 0.0;
+        nb.density_grad_sum = 0.0;
         for i in 0..n {
-            self.wl_grad_sum += wl[i].x.abs();
-            self.wl_grad_sum += wl[i].y.abs();
-            self.density_grad_sum += den[i].x.abs();
-            self.density_grad_sum += den[i].y.abs();
+            nb.wl_grad_sum += wl[i].x.abs();
+            nb.wl_grad_sum += wl[i].y.abs();
+            nb.density_grad_sum += den[i].x.abs();
+            nb.density_grad_sum += den[i].y.abs();
         }
         match slot {
             Slot::Prev => {
-                self.prev_slp_wl = wl;
-                self.prev_slp_den = den;
-                self.prev_slp_sum = sum;
+                nb.prev_slp_wl = wl;
+                nb.prev_slp_den = den;
+                nb.prev_slp_sum = sum;
             }
             Slot::Cur => {
-                self.cur_slp_wl = wl;
-                self.cur_slp_den = den;
-                self.cur_slp_sum = sum;
+                nb.cur_slp_wl = wl;
+                nb.cur_slp_den = den;
+                nb.cur_slp_sum = sum;
             }
             Slot::Next => {
-                self.next_slp_wl = wl;
-                self.next_slp_den = den;
-                self.next_slp_sum = sum;
+                nb.next_slp_wl = wl;
+                nb.next_slp_den = den;
+                nb.next_slp_sum = sum;
             }
         }
     }
 
-    /// `NesterovPlace::npUpdate*Gradient`: a zero WA sum halves the coefficients and retries (up to
-    /// ten times); a NaN or infinite sum is a divergence (GPL-0306).
-    fn np_update_gradient(&mut self, slot: Slot) {
-        self.update_gradients(slot);
-        if self.wl_grad_sum == 0.0 && self.recursion_wl < MAX_RECURSION_WL_COEF {
+    /// `NesterovPlace::npUpdate*Gradient(nb)`: a zero WA sum halves the coefficients and retries
+    /// (up to ten times, a count shared by every region); a NaN or infinite sum is a divergence
+    /// (`checkInvalidValues`, GPL-0306).
+    fn np_update_gradient(&mut self, b: usize, slot: Slot) {
+        self.update_gradients(b, slot);
+        if self.nbs[b].wl_grad_sum == 0.0 && self.recursion_wl < MAX_RECURSION_WL_COEF {
             self.wl_coef_x = (f64::from(self.wl_coef_x) * 0.5) as f32;
             self.wl_coef_y = (f64::from(self.wl_coef_y) * 0.5) as f32;
             self.base_wl_coef = (f64::from(self.base_wl_coef) * 0.5) as f32;
             self.update_wirelength_force_wa();
             self.recursion_wl += 1;
-            self.np_update_gradient(slot);
+            self.np_update_gradient(b, slot);
             return;
         }
         let bad = |v: f32| v.is_nan() || v.is_infinite();
-        if bad(self.wl_grad_sum) || bad(self.density_grad_sum) {
+        if bad(self.nbs[b].wl_grad_sum) || bad(self.nbs[b].density_grad_sum) {
             self.diverge = Some((306, "RePlAce diverged at wire/density gradient Sum. An internal value is NaN or Inf."));
             self.num_region_diverged = 1;
         }
@@ -1419,81 +1466,87 @@ impl Nesterov {
 
     /// `initDensity1`: every cell inside the grid, the four coordinate slots at its density
     /// centre, the bins, the first HPWL, the field, the base WA coefficient and the overflow.
-    fn init_density1(&mut self) {
-        let n = self.gcells.len();
-        for v in [&mut self.cur_slp, &mut self.next_slp, &mut self.prev_slp, &mut self.cur, &mut self.next] {
-            v.resize(n, FloatPoint::default());
-        }
-        for v in [&mut self.cur_slp_wl, &mut self.cur_slp_den, &mut self.cur_slp_sum, &mut self.next_slp_wl, &mut self.next_slp_den, &mut self.next_slp_sum, &mut self.prev_slp_wl, &mut self.prev_slp_den, &mut self.prev_slp_sum] {
-            v.resize(n, FloatPoint::default());
-        }
-        for v in [&mut self.snapshot, &mut self.snapshot_slp, &mut self.snapshot_slp_sum, &mut self.snapshot_prev_slp_sum] {
-            v.resize(n, FloatPoint::default());
+    fn init_density1(&mut self, b: usize) {
+        let n = self.nbs[b].cells.len();
+        {
+            let nb = &mut self.nbs[b];
+            for v in [&mut nb.cur_slp, &mut nb.next_slp, &mut nb.prev_slp, &mut nb.cur, &mut nb.next] {
+                v.resize(n, FloatPoint::default());
+            }
+            for v in [&mut nb.cur_slp_wl, &mut nb.cur_slp_den, &mut nb.cur_slp_sum, &mut nb.next_slp_wl, &mut nb.next_slp_den, &mut nb.next_slp_sum, &mut nb.prev_slp_wl, &mut nb.prev_slp_den, &mut nb.prev_slp_sum] {
+                v.resize(n, FloatPoint::default());
+            }
+            for v in [&mut nb.snapshot, &mut nb.snapshot_slp, &mut nb.snapshot_slp_sum, &mut nb.snapshot_prev_slp_sum] {
+                v.resize(n, FloatPoint::default());
+            }
         }
         for i in 0..n {
-            self.update_density_coordi_layout_inside(i);
-            let g = &self.gcells[i];
+            self.update_density_coordi_layout_inside(b, i);
+            let g = &self.gcells[self.nbs[b].cells[i]];
             let p = FloatPoint::new(g.d_cx() as f32, g.d_cy() as f32);
-            self.cur_slp[i] = p;
-            self.prev_slp[i] = p;
-            self.cur[i] = p;
+            let nb = &mut self.nbs[b];
+            nb.cur_slp[i] = p;
+            nb.prev_slp[i] = p;
+            nb.cur[i] = p;
         }
-        let cs = self.cur_slp.clone();
-        self.update_gcell_density_center_location(&cs);
-        self.prev_hpwl = self.hpwl();
-        self.update_density_field_bin();
-        self.base_wl_coef_nb = (f64::from(self.o.init_wirelength_coef) / (f64::from((self.bg.size_x + self.bg.size_y) as f32) * 0.5)) as f32;
-        let nia = nesterov_insts_area(self) as f32;
-        self.sum_overflow = self.bg.overflow as f32 / nia;
-        self.sum_overflow_unscaled = self.bg.overflow_unscaled as f32 / nia;
+        let cs = self.nbs[b].cur_slp.clone();
+        self.update_gcell_density_center_location(b, &cs);
+        let hpwl = self.hpwl();
+        self.nbs[b].prev_hpwl = hpwl;
+        self.update_density_field_bin(b);
+        let init_wl = self.o.init_wirelength_coef;
+        let nb = &mut self.nbs[b];
+        nb.base_wl_coef_nb = (f64::from(init_wl) / (f64::from((nb.bg.size_x + nb.bg.size_y) as f32) * 0.5)) as f32;
+        let nia = nesterov_insts_area(nb) as f32;
+        nb.sum_overflow = nb.bg.overflow as f32 / nia;
+        nb.sum_overflow_unscaled = nb.bg.overflow_unscaled as f32 / nia;
     }
 
     /// `updateInitialPrevSLPCoordi`: a step back along the current gradient, kept inside.
-    fn update_initial_prev_slp_coordi(&mut self) {
+    fn update_initial_prev_slp_coordi(&mut self, b: usize) {
         let c = self.initial_prev_coordi_update_coef;
-        for i in 0..self.gcells.len() {
-            let px = self.cur_slp[i].x - c * self.cur_slp_sum[i].x;
-            let py = self.cur_slp[i].y - c * self.cur_slp_sum[i].y;
-            self.prev_slp[i] = FloatPoint::new(self.inside_x(i, px), self.inside_y(i, py));
+        for i in 0..self.nbs[b].cells.len() {
+            let px = self.nbs[b].cur_slp[i].x - c * self.nbs[b].cur_slp_sum[i].x;
+            let py = self.nbs[b].cur_slp[i].y - c * self.nbs[b].cur_slp_sum[i].y;
+            let q = FloatPoint::new(self.inside_x(b, i, px), self.inside_y(b, i, py));
+            self.nbs[b].prev_slp[i] = q;
         }
-    }
-
-    /// `getStepLength`: coordinate distance over gradient distance.
-    fn step_length_of(&mut self, a: &[FloatPoint], ag: &[FloatPoint], b: &[FloatPoint], bg: &[FloatPoint]) -> f32 {
-        self.coordi_distance = distance(a, b);
-        let grad = distance(ag, bg);
-        self.coordi_distance / grad
     }
 
     /// `initDensity2`: the first penalty (WA sum over density sum, times the initial factor), the
-    /// overflow, and the first step length.
-    fn init_density2(&mut self) -> f32 {
-        if self.wl_grad_sum == 0.0 {
-            self.density_penalty = self.o.init_density_penalty;
-            self.update_gradients(Slot::Prev);
+    /// overflow, and the first step length (`getStepLength`: coordinate distance over gradient
+    /// distance).
+    fn init_density2(&mut self, b: usize) -> f32 {
+        if self.nbs[b].wl_grad_sum == 0.0 {
+            self.nbs[b].density_penalty = self.o.init_density_penalty;
+            self.update_gradients(b, Slot::Prev);
         }
-        if self.wl_grad_sum != 0.0 {
-            self.density_penalty = (self.wl_grad_sum / self.density_grad_sum) * self.o.init_density_penalty;
+        let idp = self.o.init_density_penalty;
+        let nb = &mut self.nbs[b];
+        if nb.wl_grad_sum != 0.0 {
+            nb.density_penalty = (nb.wl_grad_sum / nb.density_grad_sum) * idp;
         }
-        let nia = nesterov_insts_area(self) as f32;
-        self.sum_overflow = self.bg.overflow as f32 / nia;
-        self.sum_overflow_unscaled = self.bg.overflow_unscaled as f32 / nia;
-        let (p, ps, c, csum) = (self.prev_slp.clone(), self.prev_slp_sum.clone(), self.cur_slp.clone(), self.cur_slp_sum.clone());
-        self.step_length = self.step_length_of(&p, &ps, &c, &csum);
-        self.step_length
+        let nia = nesterov_insts_area(nb) as f32;
+        nb.sum_overflow = nb.bg.overflow as f32 / nia;
+        nb.sum_overflow_unscaled = nb.bg.overflow_unscaled as f32 / nia;
+        nb.coordi_distance = distance(&nb.prev_slp, &nb.cur_slp);
+        let grad = distance(&nb.prev_slp_sum, &nb.cur_slp_sum);
+        nb.step_length = nb.coordi_distance / grad;
+        nb.step_length
     }
 
-    /// A state probe (`vygDump`), in the instrumented reference's format.
-    fn probe(&self, log: &mut Log, tag: &str, iter: i32, a: f32, b: f32) {
+    /// A state probe (`vygDump`) of region `b`, in the instrumented reference's format.
+    fn probe(&self, log: &mut Log, b: usize, tag: &str, iter: i32, a: f32, bb: f32) {
+        let nb = &self.nbs[b];
         if tag == "NPINIT" && std::env::var_os("VYG_NP_CELLS").is_some() {
-            for (i, g) in self.gcells.iter().enumerate() {
-                let v = [self.cur_slp_wl[i].x, self.cur_slp_wl[i].y, self.cur_slp_den[i].x, self.cur_slp_den[i].y, self.cur_slp_sum[i].x, self.cur_slp_sum[i].y, self.prev_slp_wl[i].x, self.prev_slp_wl[i].y, self.prev_slp_sum[i].x, self.prev_slp_sum[i].y];
+            for (i, g) in nb.cells.iter().map(|&gi| &self.gcells[gi]).enumerate() {
+                let v = [nb.cur_slp_wl[i].x, nb.cur_slp_wl[i].y, nb.cur_slp_den[i].x, nb.cur_slp_den[i].y, nb.cur_slp_sum[i].x, nb.cur_slp_sum[i].y, nb.prev_slp_wl[i].x, nb.prev_slp_wl[i].y, nb.prev_slp_sum[i].x, nb.prev_slp_sum[i].y];
                 let hex: Vec<String> = v.iter().map(|f| format!("{:08x}", f.to_bits())).collect();
                 eprintln!("VYGNBC|{i}|{}|{}|{}|{}", g.pins.len(), g.dx(), g.dy(), hex.join("|"));
             }
         }
         let (mut hd, mut hf, mut hp) = (FNV0, FNV0, FNV0);
-        for bin in &self.bg.bins {
+        for bin in &nb.bg.bins {
             hd = fnv(&bin.density.to_le_bytes(), hd);
             hf = fnv(&bin.field_x.to_le_bytes(), hf);
             hf = fnv(&bin.field_y.to_le_bytes(), hf);
@@ -1502,121 +1555,154 @@ impl Nesterov {
         log.trace(format!(
             "VYGNB|{tag}|{iter}|{:08x}|{:08x}|{:08x}|{:08x}|{:08x}|{:08x}|{:08x}|{:08x}|{}|{}|{}|{:016x}|{:016x}|{:016x}|{:016x}|{:016x}|{:016x}|{:016x}|{:016x}",
             a.to_bits(),
-            b.to_bits(),
-            self.step_length.to_bits(),
-            self.density_penalty.to_bits(),
-            self.sum_overflow.to_bits(),
-            self.sum_overflow_unscaled.to_bits(),
-            self.wl_grad_sum.to_bits(),
-            self.density_grad_sum.to_bits(),
-            self.prev_hpwl,
-            self.bg.overflow,
-            self.bg.overflow_unscaled,
-            fnv_points(&self.cur_slp),
-            fnv_points(&self.cur),
-            fnv_points(&self.prev_slp),
-            fnv_points(&self.cur_slp_sum),
-            fnv_points(&self.prev_slp_sum),
+            bb.to_bits(),
+            nb.step_length.to_bits(),
+            nb.density_penalty.to_bits(),
+            nb.sum_overflow.to_bits(),
+            nb.sum_overflow_unscaled.to_bits(),
+            nb.wl_grad_sum.to_bits(),
+            nb.density_grad_sum.to_bits(),
+            nb.prev_hpwl,
+            nb.bg.overflow,
+            nb.bg.overflow_unscaled,
+            fnv_points(&nb.cur_slp),
+            fnv_points(&nb.cur),
+            fnv_points(&nb.prev_slp),
+            fnv_points(&nb.cur_slp_sum),
+            fnv_points(&nb.prev_slp_sum),
             hd,
             hf,
             hp
         ));
     }
 
-    /// `NesterovPlace::init`: the region's density init, the WA coefficient from the overflow,
-    /// the current gradient, an approximate previous point and its gradient, then the first step
-    /// length — re-run with a ten times larger back-step while it is NaN or infinite.
+    /// `NesterovPlace::init`: every region's density init, the WA coefficient from their mean
+    /// overflow and mean base coefficient, per region the current gradient, an approximate
+    /// previous point, its bins and field; the WA forces there; per region the previous gradient;
+    /// then each region's first step length — a NaN or infinite one re-runs the whole init with a
+    /// ten times larger back-step (and the loop stops: the outer init finishes after the inner).
     fn np_init(&mut self, log: &mut Log) -> Res<()> {
-        self.init_density1();
-        self.average_overflow = self.sum_overflow / 1.0;
-        self.base_wl_coef = self.base_wl_coef_nb / 1.0;
+        let mut total_sum_overflow = 0.0f32;
+        let mut total_base_wl_coef = 0.0f32;
+        for b in 0..self.nbs.len() {
+            self.init_density1(b);
+            total_sum_overflow += self.nbs[b].sum_overflow;
+            total_base_wl_coef += self.nbs[b].base_wl_coef_nb;
+        }
+        let n = self.nbs.len() as f32;
+        self.average_overflow = total_sum_overflow / n;
+        self.base_wl_coef = total_base_wl_coef / n;
         self.update_wirelength_coef(self.average_overflow);
         self.update_wirelength_force_wa();
-        self.np_update_gradient(Slot::Cur);
-        self.update_initial_prev_slp_coordi();
-        let p = self.prev_slp.clone();
-        self.update_gcell_density_center_location(&p);
-        self.update_density_field_bin();
-        self.update_wirelength_force_wa();
-        self.np_update_gradient(Slot::Prev);
-        let step = self.init_density2();
-        // A NaN or infinite first step re-runs the whole init with a ten times larger back-step,
-        // then (the loop `break`s) the outer init finishes too — its own end runs after the inner.
-        if (step.is_nan() || step.is_infinite()) && self.recursion_init_slp < MAX_RECURSION_INIT_SLP_COEF {
-            self.initial_prev_coordi_update_coef *= 10.0;
-            self.recursion_init_slp += 1;
-            self.np_init(log)?;
-        } else if step.is_nan() || step.is_infinite() {
-            return log.error("GPL", 304, format!("RePlAce diverged at initial iteration with steplength being {step}. Re-run with a smaller init_density_penalty value."));
+        for b in 0..self.nbs.len() {
+            self.np_update_gradient(b, Slot::Cur);
+            self.update_initial_prev_slp_coordi(b);
+            let p = self.nbs[b].prev_slp.clone();
+            self.update_gcell_density_center_location(b, &p);
+            self.update_density_field_bin(b);
         }
-        self.probe(log, "NPINIT", -1, self.wl_coef_x, self.base_wl_coef);
+        self.update_wirelength_force_wa();
+        for b in 0..self.nbs.len() {
+            self.np_update_gradient(b, Slot::Prev);
+        }
+        for b in 0..self.nbs.len() {
+            let step = self.init_density2(b);
+            if (step.is_nan() || step.is_infinite()) && self.recursion_init_slp < MAX_RECURSION_INIT_SLP_COEF {
+                self.initial_prev_coordi_update_coef *= 10.0;
+                self.recursion_init_slp += 1;
+                self.np_init(log)?;
+                break;
+            }
+            if step.is_nan() || step.is_infinite() {
+                return log.error("GPL", 304, format!("RePlAce diverged at initial iteration with steplength being {step}. Re-run with a smaller init_density_penalty value."));
+            }
+        }
+        for b in 0..self.nbs.len() {
+            self.probe(log, b, "NPINIT", -1, self.wl_coef_x, self.base_wl_coef);
+        }
         Ok(())
     }
 
     /// `nesterovUpdateCoordinates`: the next point and the next look-ahead point, kept inside; the
     /// bins and the field at the look-ahead point.
-    fn nesterov_update_coordinates(&mut self, coeff: f32) {
-        if self.is_converged {
+    fn nesterov_update_coordinates(&mut self, b: usize, coeff: f32) {
+        if self.nbs[b].is_converged {
             return;
         }
-        let s = self.step_length;
-        for k in 0..self.gcells.len() {
-            let nx = self.cur_slp[k].x + s * self.cur_slp_sum[k].x;
-            let ny = self.cur_slp[k].y + s * self.cur_slp_sum[k].y;
-            let sx = nx + coeff * (nx - self.cur[k].x);
-            let sy = ny + coeff * (ny - self.cur[k].y);
-            self.next[k] = FloatPoint::new(self.inside_x(k, nx), self.inside_y(k, ny));
-            self.next_slp[k] = FloatPoint::new(self.inside_x(k, sx), self.inside_y(k, sy));
+        let s = self.nbs[b].step_length;
+        for k in 0..self.nbs[b].cells.len() {
+            let nb = &self.nbs[b];
+            let nx = nb.cur_slp[k].x + s * nb.cur_slp_sum[k].x;
+            let ny = nb.cur_slp[k].y + s * nb.cur_slp_sum[k].y;
+            let sx = nx + coeff * (nx - nb.cur[k].x);
+            let sy = ny + coeff * (ny - nb.cur[k].y);
+            let next = FloatPoint::new(self.inside_x(b, k, nx), self.inside_y(b, k, ny));
+            let next_slp = FloatPoint::new(self.inside_x(b, k, sx), self.inside_y(b, k, sy));
+            self.nbs[b].next[k] = next;
+            self.nbs[b].next_slp[k] = next_slp;
         }
-        let ns = self.next_slp.clone();
-        self.update_gcell_density_center_location(&ns);
-        self.update_density_field_bin();
+        let ns = self.nbs[b].next_slp.clone();
+        self.update_gcell_density_center_location(b, &ns);
+        self.update_density_field_bin(b);
     }
 
     /// `nesterovUpdateStepLength`: accept the new step when it is at most 0.95 of the last (in
     /// double); a step under 0.01 is set to 0.01 and not accepted.
-    fn nesterov_update_step_length(&mut self) -> bool {
-        if self.is_converged {
+    fn nesterov_update_step_length(&mut self, b: usize) -> bool {
+        let nb = &mut self.nbs[b];
+        if nb.is_converged {
             return true;
         }
-        let (c, cs, n, ns) = (self.cur_slp.clone(), self.cur_slp_sum.clone(), self.next_slp.clone(), self.next_slp_sum.clone());
-        let new = self.step_length_of(&c, &cs, &n, &ns);
+        nb.coordi_distance = distance(&nb.cur_slp, &nb.next_slp);
+        let grad = distance(&nb.cur_slp_sum, &nb.next_slp_sum);
+        let new = nb.coordi_distance / grad;
         if new.is_nan() || new.is_infinite() {
-            self.is_diverged = true;
+            nb.is_diverged = true;
             return false;
         }
-        if f64::from(new) > f64::from(self.step_length) * 0.95 {
-            self.step_length = new;
+        if f64::from(new) > f64::from(nb.step_length) * 0.95 {
+            nb.step_length = new;
             return false;
         }
         if f64::from(new) < 0.01 {
-            self.step_length = 0.01f64 as f32;
+            nb.step_length = 0.01f64 as f32;
             return false;
         }
-        self.step_length = new;
+        nb.step_length = new;
         true
     }
 
-    /// `NesterovPlace::doBackTracking`: up to ten trial steps until the step length settles.
+    /// `NesterovPlace::doBackTracking`: up to ten trial steps, every region each time, until every
+    /// region's step length settles.
     fn do_back_tracking(&mut self, log: &mut Log, coeff: f32) {
         for nbt in 0..MAX_BACK_TRACK {
-            self.nesterov_update_coordinates(coeff);
+            for b in 0..self.nbs.len() {
+                self.nesterov_update_coordinates(b, coeff);
+            }
             self.update_wirelength_force_wa();
             self.num_region_diverged = 0;
-            self.np_update_gradient(Slot::Next);
-            self.num_region_diverged += i32::from(self.is_diverged);
+            for b in 0..self.nbs.len() {
+                self.np_update_gradient(b, Slot::Next);
+                self.num_region_diverged += i32::from(self.nbs[b].is_diverged);
+            }
             if self.num_region_diverged > 0 {
                 self.diverge = Some((306, "RePlAce diverged at wire/density gradient Sum."));
                 break;
             }
-            let ok = self.nesterov_update_step_length();
-            self.num_region_diverged = i32::from(self.is_diverged);
+            let mut ok = 0usize;
+            self.num_region_diverged = 0;
+            for b in 0..self.nbs.len() {
+                ok += usize::from(self.nesterov_update_step_length(b));
+                self.num_region_diverged += i32::from(self.nbs[b].is_diverged);
+            }
             if self.num_region_diverged > 0 {
                 self.diverge = Some((305, "RePlAce diverged during gradient descent calculation, resulting in an invalid step length (Inf or NaN). This is often caused by numerical instability or high placement density. Consider reducing placement density to potentially resolve the issue."));
                 break;
             }
-            self.probe(log, "BT", nbt, self.wl_coef_x, coeff);
-            if !ok {
+            for b in 0..self.nbs.len() {
+                self.probe(log, b, "BT", nbt, self.wl_coef_x, coeff);
+            }
+            if ok != self.nbs.len() {
                 break;
             }
         }
@@ -1624,86 +1710,93 @@ impl Nesterov {
 
     /// `nesterovAdjustPhi`: the maximum phi coefficient drops 1% once overflow is below 0.35, and
     /// never to 1.0 or below.
-    fn nesterov_adjust_phi(&mut self) {
-        if self.is_converged {
+    fn nesterov_adjust_phi(&mut self, b: usize) {
+        let nb = &mut self.nbs[b];
+        if nb.is_converged {
             return;
         }
-        if !self.max_phi_coef_changed && self.sum_overflow_unscaled < 0.35f32 {
-            self.max_phi_coef_changed = true;
-            self.max_phi_coef = (f64::from(self.max_phi_coef) * 0.99) as f32;
+        if !nb.max_phi_coef_changed && nb.sum_overflow_unscaled < 0.35f32 {
+            nb.max_phi_coef_changed = true;
+            nb.max_phi_coef = (f64::from(nb.max_phi_coef) * 0.99) as f32;
         }
-        if self.max_phi_coef <= 1.0f32 {
-            self.max_phi_coef = 1.01f32;
+        if nb.max_phi_coef <= 1.0f32 {
+            nb.max_phi_coef = 1.01f32;
         }
     }
 
     /// `getPhiCoef`: `max · max^(-Δ)` in double for a growing HPWL, `max` otherwise; at least `min`.
-    fn phi_coef(&self, scaled_diff_hpwl: f32) -> f32 {
-        let r = if scaled_diff_hpwl < 0.0 {
-            f64::from(self.max_phi_coef)
-        } else {
-            f64::from(self.max_phi_coef) * f64::from(self.max_phi_coef).powf(-f64::from(scaled_diff_hpwl))
-        } as f32;
+    fn phi_coef(&self, b: usize, scaled_diff_hpwl: f32) -> f32 {
+        let m = self.nbs[b].max_phi_coef;
+        let r = if scaled_diff_hpwl < 0.0 { f64::from(m) } else { f64::from(m) * f64::from(m).powf(-f64::from(scaled_diff_hpwl)) } as f32;
         self.o.min_phi_coef.max(r)
     }
 
     /// `NesterovBase::updateNextIter`: rotate the slots, the overflow over a floor that grows with
-    /// the iteration, the progress row every tenth iteration, the penalty times the phi
-    /// coefficient, and the divergence watermark.
-    fn nb_update_next_iter(&mut self, log: &mut Log, d: &Design, iter: i32) {
-        if self.is_converged {
+    /// the iteration, the progress row every tenth iteration (the header only from the top level;
+    /// a region's row names it), the penalty times the phi coefficient, and the divergence
+    /// watermark.
+    fn nb_update_next_iter(&mut self, log: &mut Log, d: &Design, b: usize, iter: i32) {
+        if self.nbs[b].is_converged {
             return;
         }
-        std::mem::swap(&mut self.prev_slp, &mut self.cur_slp);
-        std::mem::swap(&mut self.prev_slp_wl, &mut self.cur_slp_wl);
-        std::mem::swap(&mut self.prev_slp_den, &mut self.cur_slp_den);
-        std::mem::swap(&mut self.prev_slp_sum, &mut self.cur_slp_sum);
-        std::mem::swap(&mut self.cur_slp, &mut self.next_slp);
-        std::mem::swap(&mut self.cur_slp_wl, &mut self.next_slp_wl);
-        std::mem::swap(&mut self.cur_slp_den, &mut self.next_slp_den);
-        std::mem::swap(&mut self.cur_slp_sum, &mut self.next_slp_sum);
-        std::mem::swap(&mut self.cur, &mut self.next);
-        let fraction = iter as f32 / self.max_iter as f32;
-        let denom = (nesterov_insts_area(self) as f32).max(fraction * self.non_place_insts_area as f32 * 0.05f32);
-        self.sum_overflow = self.bg.overflow as f32 / denom;
-        self.sum_overflow_unscaled = self.bg.overflow_unscaled as f32 / denom;
+        let max_iter = self.max_iter;
+        {
+            let nb = &mut self.nbs[b];
+            std::mem::swap(&mut nb.prev_slp, &mut nb.cur_slp);
+            std::mem::swap(&mut nb.prev_slp_wl, &mut nb.cur_slp_wl);
+            std::mem::swap(&mut nb.prev_slp_den, &mut nb.cur_slp_den);
+            std::mem::swap(&mut nb.prev_slp_sum, &mut nb.cur_slp_sum);
+            std::mem::swap(&mut nb.cur_slp, &mut nb.next_slp);
+            std::mem::swap(&mut nb.cur_slp_wl, &mut nb.next_slp_wl);
+            std::mem::swap(&mut nb.cur_slp_den, &mut nb.next_slp_den);
+            std::mem::swap(&mut nb.cur_slp_sum, &mut nb.next_slp_sum);
+            std::mem::swap(&mut nb.cur, &mut nb.next);
+            let fraction = iter as f32 / max_iter as f32;
+            let denom = (nesterov_insts_area(nb) as f32).max(fraction * nb.non_place_insts_area as f32 * 0.05f32);
+            nb.sum_overflow = nb.bg.overflow as f32 / denom;
+            nb.sum_overflow_unscaled = nb.bg.overflow_unscaled as f32 / denom;
+        }
         let hpwl = self.hpwl();
+        let nb = &mut self.nbs[b];
         if iter == 0 || iter % 10 == 0 {
             let mut pct = 0.0f32;
-            if self.prev_reported_hpwl != 0 {
-                pct = ((hpwl - self.prev_reported_hpwl) as f64 / self.prev_reported_hpwl as f64 * 100.0) as f32;
+            if nb.prev_reported_hpwl != 0 {
+                pct = ((hpwl - nb.prev_reported_hpwl) as f64 / nb.prev_reported_hpwl as f64 * 100.0) as f32;
             }
-            self.prev_reported_hpwl = hpwl;
-            self.prev_reported_overflow_unscaled = self.sum_overflow_unscaled;
-            if iter == 0 {
+            nb.prev_reported_hpwl = hpwl;
+            nb.prev_reported_overflow_unscaled = nb.sum_overflow_unscaled;
+            let group = nb.group.as_ref().map(|g| format!(" ({g})")).unwrap_or_default();
+            if iter == 0 && nb.group.is_none() {
                 log.info("GPL", 31, "HPWL: Half-Perimeter Wirelength");
                 log.report(format!("{:>9} | {:>8} | {:>13} | {:>8} | {:>9} | {:>5}", "Iteration", "Overflow", "HPWL (um)", "HPWL(%)", "Penalty", "Group"));
                 log.report("---------------------------------------------------------------");
             }
-            log.report(format!(
-                "{iter:9} | {:8.4} | {} | {:+7.2}% | {} | {:>5}",
-                self.sum_overflow_unscaled,
-                fmt_e(hpwl as f64 / f64::from(d.dbu), 6, 13),
-                pct,
-                fmt_e(f64::from(self.density_penalty), 2, 9),
-                ""
-            ));
+            log.report(format!("{iter:9} | {:8.4} | {} | {:+7.2}% | {} | {:>5}", nb.sum_overflow_unscaled, fmt_e(hpwl as f64 / f64::from(d.dbu), 6, 13), pct, fmt_e(f64::from(nb.density_penalty), 2, 9), group));
         }
-        let phi = self.phi_coef((hpwl - self.prev_hpwl) as f32 / self.reference_hpwl);
-        self.density_penalty *= phi;
-        self.prev_hpwl = hpwl;
-        if iter > 50 && self.min_sum_overflow > self.sum_overflow_unscaled {
-            self.min_sum_overflow = self.sum_overflow_unscaled;
-            self.hpwl_with_min_sum_overflow = self.prev_hpwl as f32;
+        let scaled = (hpwl - self.nbs[b].prev_hpwl) as f32 / self.reference_hpwl;
+        let phi = self.phi_coef(b, scaled);
+        let nb = &mut self.nbs[b];
+        nb.density_penalty *= phi;
+        nb.prev_hpwl = hpwl;
+        if iter > 50 && nb.min_sum_overflow > nb.sum_overflow_unscaled {
+            nb.min_sum_overflow = nb.sum_overflow_unscaled;
+            nb.hpwl_with_min_sum_overflow = nb.prev_hpwl as f32;
         }
     }
 
-    /// `NesterovPlace::updateNextIter`: the region's update, the WA coefficient from the new
+    /// `NesterovPlace::updateNextIter`: every region's update, the WA coefficient from their mean
     /// overflow, and the minimum-HPWL watermark the divergence revert returns to.
     fn np_update_next_iter(&mut self, log: &mut Log, d: &Design, iter: i32) {
-        self.nb_update_next_iter(log, d, iter);
-        self.average_overflow = self.sum_overflow / 1.0;
-        self.average_overflow_unscaled = self.sum_overflow_unscaled / 1.0;
+        let mut total = 0.0f32;
+        let mut total_unscaled = 0.0f32;
+        for b in 0..self.nbs.len() {
+            self.nb_update_next_iter(log, d, b, iter);
+            total += self.nbs[b].sum_overflow;
+            total_unscaled += self.nbs[b].sum_overflow_unscaled;
+        }
+        let n = self.nbs.len() as f32;
+        self.average_overflow = total / n;
+        self.average_overflow_unscaled = total_unscaled / n;
         self.update_wirelength_coef(self.average_overflow);
         if !self.o.disable_revert_if_diverge {
             let hpwl = self.hpwl();
@@ -1719,64 +1812,73 @@ impl Nesterov {
     }
 
     /// `saveSnapshot`.
-    fn save_snapshot(&mut self) {
-        if self.is_converged {
+    fn save_snapshot(&mut self, b: usize) {
+        let nb = &mut self.nbs[b];
+        if nb.is_converged {
             return;
         }
-        self.snapshot = self.cur.clone();
-        self.snapshot_slp = self.cur_slp.clone();
-        self.snapshot_slp_sum = self.cur_slp_sum.clone();
-        self.snapshot_prev_slp_sum = self.prev_slp_sum.clone();
-        self.snapshot_density_penalty = self.density_penalty;
-        self.snapshot_step_length = self.step_length;
+        nb.snapshot = nb.cur.clone();
+        nb.snapshot_slp = nb.cur_slp.clone();
+        nb.snapshot_slp_sum = nb.cur_slp_sum.clone();
+        nb.snapshot_prev_slp_sum = nb.prev_slp_sum.clone();
+        nb.snapshot_density_penalty = nb.density_penalty;
+        nb.snapshot_step_length = nb.step_length;
     }
 
     /// `revertToSnapshot`.
-    fn revert_to_snapshot(&mut self) {
-        if self.is_converged {
+    fn revert_to_snapshot(&mut self, b: usize) {
+        if self.nbs[b].is_converged {
             return;
         }
-        self.cur = self.snapshot.clone();
-        self.cur_slp = self.snapshot_slp.clone();
-        self.cur_slp_sum = self.snapshot_slp_sum.clone();
-        self.prev_slp_sum = self.snapshot_prev_slp_sum.clone();
-        self.density_penalty = self.snapshot_density_penalty;
-        self.step_length = self.snapshot_step_length;
-        let c = self.cur.clone();
-        self.update_gcell_density_center_location(&c);
-        self.update_density_field_bin();
-        self.is_diverged = false;
-        self.prev_reported_hpwl = 0;
-        self.prev_reported_overflow_unscaled = 0.0;
+        {
+            let nb = &mut self.nbs[b];
+            nb.cur = nb.snapshot.clone();
+            nb.cur_slp = nb.snapshot_slp.clone();
+            nb.cur_slp_sum = nb.snapshot_slp_sum.clone();
+            nb.prev_slp_sum = nb.snapshot_prev_slp_sum.clone();
+            nb.density_penalty = nb.snapshot_density_penalty;
+            nb.step_length = nb.snapshot_step_length;
+        }
+        let c = self.nbs[b].cur.clone();
+        self.update_gcell_density_center_location(b, &c);
+        self.update_density_field_bin(b);
+        let nb = &mut self.nbs[b];
+        nb.is_diverged = false;
+        nb.prev_reported_hpwl = 0;
+        nb.prev_reported_overflow_unscaled = 0.0;
     }
 
     /// `NesterovBase::checkDivergence`.
-    fn check_divergence(&mut self, log: &mut Log) -> bool {
-        if self.sum_overflow_unscaled < 0.2f32
-            && self.sum_overflow_unscaled - self.min_sum_overflow >= 0.02f32
-            && self.hpwl_with_min_sum_overflow * 1.2f32 < self.prev_hpwl as f32
-        {
-            self.is_diverged = true;
+    fn check_divergence(&mut self, log: &mut Log, b: usize) -> bool {
+        let nb = &mut self.nbs[b];
+        if nb.sum_overflow_unscaled < 0.2f32 && nb.sum_overflow_unscaled - nb.min_sum_overflow >= 0.02f32 && nb.hpwl_with_min_sum_overflow * 1.2f32 < nb.prev_hpwl as f32 {
+            nb.is_diverged = true;
             log.warn("GPL", 323, "Divergence detected between consecutive iterations");
         }
-        if self.prev_reported_overflow_unscaled > 0.0 && self.prev_reported_hpwl > 0 {
-            let change = self.sum_overflow_unscaled - self.prev_reported_overflow_unscaled;
-            let increase = (self.prev_hpwl - self.prev_reported_hpwl) as f32 / self.prev_reported_hpwl as f32;
+        if nb.prev_reported_overflow_unscaled > 0.0 && nb.prev_reported_hpwl > 0 {
+            let change = nb.sum_overflow_unscaled - nb.prev_reported_overflow_unscaled;
+            let increase = (nb.prev_hpwl - nb.prev_reported_hpwl) as f32 / nb.prev_reported_hpwl as f32;
             if change >= 0.05f32 && increase >= 0.25f32 {
-                self.is_diverged = true;
+                nb.is_diverged = true;
                 log.warn("GPL", 324, format!("Divergence detected between reported values. Overflow change: {}, HPWL increase: {}%.", fmt_g(f64::from(change)), fmt_g(f64::from(increase * 100.0f32))));
             }
         }
-        self.is_diverged
+        nb.is_diverged
     }
 
-    /// `NesterovPlace::isDiverged`: the snapshot at each new minimum HPWL; on a divergence, back to
-    /// it (GPL-0998/0999) when one was saved, else an error at the end (GPL-0307).
+    /// `NesterovPlace::isDiverged`: the snapshot of every region at each new minimum HPWL; on a
+    /// divergence in any region, every region back to it (GPL-0998/0999) when one was saved, else
+    /// an error at the end (GPL-0307).
     fn np_is_diverged(&mut self, log: &mut Log, saved: &mut bool, snap: &mut (f32, f32)) -> bool {
-        self.num_region_diverged = i32::from(self.check_divergence(log));
+        self.num_region_diverged = 0;
+        for b in 0..self.nbs.len() {
+            self.num_region_diverged += i32::from(self.check_divergence(log, b));
+        }
         if !self.o.disable_revert_if_diverge && self.num_region_diverged == 0 && self.is_min_hpwl {
             *snap = (self.wl_coef_x, self.wl_coef_y);
-            self.save_snapshot();
+            for b in 0..self.nbs.len() {
+                self.save_snapshot(b);
+            }
             *saved = true;
         }
         if self.num_region_diverged > 0 {
@@ -1787,7 +1889,9 @@ impl Nesterov {
                 self.wl_coef_x = snap.0;
                 self.wl_coef_y = snap.1;
                 self.update_wirelength_force_wa();
-                self.revert_to_snapshot();
+                for b in 0..self.nbs.len() {
+                    self.revert_to_snapshot(b);
+                }
                 self.num_region_diverged = 0;
             } else {
                 self.diverge = Some((307, "RePlAce divergence detected: Current overflow is low and increasing relative to minimum,and the HPWL has significantly worsened. Consider re-running with a smaller max_phi_cof value."));
@@ -1797,38 +1901,56 @@ impl Nesterov {
         false
     }
 
-    /// `NesterovBase::checkConvergence`: at the target overflow, the closing row, GPL-1001..1009,
-    /// every instance cell locked.
-    fn check_convergence(&mut self, log: &mut Log, d: &Design, iter: i32) -> bool {
-        if self.is_converged {
+    /// `NesterovBase::checkConvergence`: at the target overflow, the closing row (a region's named),
+    /// GPL-1001 (the top level) or GPL-1016 (a region), GPL-1002..1009, the region's instance cells
+    /// locked.
+    fn check_convergence(&mut self, log: &mut Log, d: &Design, b: usize, iter: i32) -> bool {
+        if self.nbs[b].is_converged {
             return true;
         }
-        if self.sum_overflow_unscaled > self.o.overflow {
+        if self.nbs[b].sum_overflow_unscaled > self.o.overflow {
             return false;
         }
         let hpwl = self.hpwl();
-        log.report(format!("{iter:9} | {:8.4} | {} | {:>8} | {} | {:>5}", self.sum_overflow_unscaled, fmt_e(hpwl as f64 / f64::from(d.dbu), 6, 13), "", fmt_e(f64::from(self.density_penalty), 2, 9), ""));
+        let nb = &self.nbs[b];
+        let group = nb.group.clone().unwrap_or_default();
+        log.report(format!("{iter:9} | {:8.4} | {} | {:>8} | {} | {:>5}", nb.sum_overflow_unscaled, fmt_e(hpwl as f64 / f64::from(d.dbu), 6, 13), "", fmt_e(f64::from(nb.density_penalty), 2, 9), group));
         log.report("---------------------------------------------------------------");
-        log.info("GPL", 1001, format!("Global placement finished at iteration {iter}"));
-        let nia = nesterov_insts_area(self);
+        match &nb.group {
+            Some(g) => log.info("GPL", 1016, format!("Region '{g}' placement finished at iteration {iter}")),
+            None => log.info("GPL", 1001, format!("Global placement finished at iteration {iter}")),
+        }
+        let nia = nesterov_insts_area(nb);
         log.info("GPL", 1002, format!("Placed Cell Area            {:10.4}", dbu_area(d, nia as f64)));
-        log.info("GPL", 1003, format!("Available Free Area         {:10.4}", dbu_area(d, self.white_space_area as f64)));
-        log.info("GPL", 1004, format!("Minimum Feasible Density        {:.4} (cell_area / free_area)", self.uniform_target_density));
+        log.info("GPL", 1003, format!("Available Free Area         {:10.4}", dbu_area(d, nb.white_space_area as f64)));
+        log.info("GPL", 1004, format!("Minimum Feasible Density        {:.4} (cell_area / free_area)", nb.uniform_target_density));
         log.info("GPL", 1006, "  Suggested Target Densities:");
-        let w = self.white_space_area as f64;
+        let w = nb.white_space_area as f64;
         log.info("GPL", 1007, format!("    - For 90% usage of free space: {:.4}", nia as f64 / (w * 0.90)));
         log.info("GPL", 1008, format!("    - For 80% usage of free space: {:.4}", nia as f64 / (w * 0.80)));
         if nia as f64 / (w * 0.50) <= 1.0 {
             log.info("GPL", 1009, format!("    - For 50% usage of free space: {:.4}", nia as f64 / (w * 0.50)));
         }
-        if self.uniform_target_density > 0.95f32 {
-            log.warn("GPL", 1015, format!("High uniform density (>{:.2}) may cause congestion or legalization issues.", self.uniform_target_density));
+        if nb.uniform_target_density > 0.95f32 {
+            log.warn("GPL", 1015, format!("High uniform density (>{:.2}) may cause congestion or legalization issues.", nb.uniform_target_density));
         }
-        for g in self.gcells.iter_mut().filter(|g| g.is_instance()) {
-            g.locked = true;
+        for k in 0..self.nbs[b].cells.len() {
+            let gi = self.nbs[b].cells[k];
+            if self.gcells[gi].is_instance() {
+                self.gcells[gi].locked = true;
+            }
         }
-        self.is_converged = true;
+        self.nbs[b].is_converged = true;
         true
+    }
+
+    /// `NesterovPlace::isConverged`: every region asked, in order; converged when all are.
+    fn np_is_converged(&mut self, log: &mut Log, d: &Design, iter: i32) -> bool {
+        let mut converged = 0;
+        for b in 0..self.nbs.len() {
+            converged += usize::from(self.check_convergence(log, d, b, iter));
+        }
+        converged == self.nbs.len()
     }
 }
 
@@ -1849,52 +1971,59 @@ pub fn placed_locations(c: &Common, nb: &Nesterov) -> Vec<(usize, i32, i32)> {
 /// `Replace::doNesterovPlace` from GPL-0084 (the placer is built): the reference HPWL, the
 /// placer's init, then the loop — `NesterovPlace::doNesterovPlace` — and its report. Returns the
 /// final iteration.
-pub fn do_nesterov_place(log: &mut Log, d: &Design, nb: &mut Nesterov) -> Res<i32> {
+pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i32> {
     // `NesterovPlaceVars`: the reference HPWL, from the design's own (initial) HPWL when unset.
-    let design_hpwl = nb.hpwl();
-    nb.reference_hpwl = if nb.o.reference_hpwl > 0.0 { nb.o.reference_hpwl } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) };
-    nb.np_init(log)?;
+    let design_hpwl = np.hpwl();
+    np.reference_hpwl = if np.o.reference_hpwl > 0.0 { np.o.reference_hpwl } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) };
+    np.np_init(log)?;
     log.info("GPL", 84, "---- Execute Nesterov Global Placement.");
-    if nb.num_region_diverged > 0 {
-        let (code, msg) = nb.diverge.unwrap_or((0, ""));
+    if np.num_region_diverged > 0 {
+        let (code, msg) = np.diverge.unwrap_or((0, ""));
         return log.error("GPL", code, msg);
     }
-    nb.max_phi_coef_changed = false;
-    nb.min_sum_overflow = 1e30;
-    nb.hpwl_with_min_sum_overflow = 1e30;
-    nb.is_converged = false;
-    let original_area = nesterov_insts_area(nb);
+    let mut original_area = 0i64;
+    for nb in np.nbs.iter_mut() {
+        nb.max_phi_coef_changed = false;
+        nb.min_sum_overflow = 1e30;
+        nb.hpwl_with_min_sum_overflow = 1e30;
+        nb.is_converged = false;
+        original_area += nesterov_insts_area(nb);
+    }
     let (mut saved, mut snap) = (false, (0f32, 0f32));
     let mut cur_a = 1.0f32;
     let mut iter = 0;
-    while iter < nb.max_iter {
+    while iter < np.max_iter {
         let prev_a = cur_a;
         cur_a = ((1.0 + (4.0 * f64::from(prev_a) * f64::from(prev_a) + 1.0).sqrt()) * 0.5) as f32;
         let coeff = ((f64::from(prev_a) - 1.0) / f64::from(cur_a)) as f32;
-        nb.do_back_tracking(log, coeff);
-        nb.nesterov_adjust_phi();
-        if nb.num_region_diverged > 0 {
+        np.do_back_tracking(log, coeff);
+        for b in 0..np.nbs.len() {
+            np.nesterov_adjust_phi(b);
+        }
+        if np.num_region_diverged > 0 {
             break;
         }
-        nb.np_update_next_iter(log, d, iter);
-        nb.probe(log, "IT", iter, nb.wl_coef_x, cur_a);
-        if nb.np_is_diverged(log, &mut saved, &mut snap) {
+        np.np_update_next_iter(log, d, iter);
+        for b in 0..np.nbs.len() {
+            np.probe(log, b, "IT", iter, np.wl_coef_x, cur_a);
+        }
+        if np.np_is_diverged(log, &mut saved, &mut snap) {
             break;
         }
-        if nb.check_convergence(log, d, iter) {
+        if np.np_is_converged(log, d, iter) {
             break;
         }
         iter += 1;
     }
     // `reportResults`.
-    if iter >= nb.max_iter {
-        log.warn("GPL", 1010, format!("GPL reached the maximum number of iterations for nesterov {}. Placement may have failed to converge.", nb.max_iter));
+    if iter >= np.max_iter {
+        log.warn("GPL", 1010, format!("GPL reached the maximum number of iterations for nesterov {}. Placement may have failed to converge.", np.max_iter));
     }
-    let new_area = nesterov_insts_area(nb);
+    let new_area: i64 = np.nbs.iter().map(nesterov_insts_area).sum();
     let diff = (100.0 * (new_area - original_area) as f64 / original_area as f64) as f32;
     log.info("GPL", 1014, format!("Final placement area: {:.2} ({:+.2}%)", dbu_area(d, new_area as f64), diff));
-    if nb.num_region_diverged > 0 {
-        let (code, msg) = nb.diverge.unwrap_or((0, ""));
+    if np.num_region_diverged > 0 {
+        let (code, msg) = np.diverge.unwrap_or((0, ""));
         return log.error("GPL", code, msg);
     }
     Ok(iter)

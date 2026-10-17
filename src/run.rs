@@ -135,10 +135,7 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     let outcome = do_initial_place(log, d, &vars, &ip, skip_nesterov)?;
     match (outcome, np) {
         (Outcome::InitiallyPlaced(mut c, bases, mut ip, false), Some(o)) => {
-            if bases.len() != 1 || bases[0].group.is_some() {
-                return refuse("Nesterov placement over more than the top-level region is not modelled");
-            }
-            let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases[0], &o)?;
+            let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases, &o)?;
             let iter = nesterov::do_nesterov_place(log, d, &mut nb)?;
             let locations = nesterov::placed_locations(&c, &nb);
             Ok(Outcome::Placed(c, bases, locations, iter))
@@ -194,9 +191,6 @@ fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, skip_nest
     if bases[0].place_insts.is_empty() {
         log.warn("GPL", 123, "No placeable instances in the top-level region. Removing it.");
         bases.remove(0);
-    }
-    if d.regions.iter().any(|r| !r.groups.is_empty()) {
-        return refuse("initial placement with region groups is not modelled");
     }
     let ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
     Ok(Outcome::InitiallyPlaced(common, bases, ip, skip_nesterov))
