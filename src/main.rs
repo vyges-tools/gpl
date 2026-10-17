@@ -20,6 +20,32 @@ fn e(err: vyges_opendb::Error) -> Stop {
 }
 
 /// The design as `PlacerBaseCommon` / `PlacerBase` read it, in the block's own orders.
+/// `updateDbGCells` then `reportHpwlMetric`: each placed instance at its location, PLACED; then
+/// GPL-1018 over every non-supply, non-special net's terminal box in the database.
+fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i32, i32)]) -> Result<(), String> {
+    let names = db.block_get_insts();
+    for &(di, x, y) in locations {
+        let e = |e: vyges_opendb::Error| format!("{}: {e}", names[di]);
+        db.inst_set_placement_status(&names[di], "PLACED").map_err(e)?;
+        db.set_inst_location(&names[di], x, y).map_err(e)?;
+    }
+    let mut hpwl = 0i64;
+    for net in db.block_get_nets() {
+        let sig = db.net_get_sig_type(&net);
+        if matches!(sig.as_str(), "POWER" | "GROUND") || db.net_is_special(&net) {
+            continue;
+        }
+        let (x0, y0, x1, y1) = (db.net_get_term_b_box_x_min(&net), db.net_get_term_b_box_y_min(&net), db.net_get_term_b_box_x_max(&net), db.net_get_term_b_box_y_max(&net));
+        if x0 > x1 || y0 > y1 {
+            continue;
+        }
+        hpwl += i64::from(x1 - x0) + i64::from(y1 - y0);
+    }
+    let dbu = f64::from(db.tech_get_db_units_per_micron());
+    log.info("GPL", 1018, format!("Final HPWL (um): {:.2}", hpwl as f64 / dbu));
+    Ok(())
+}
+
 fn design(db: &Db) -> Res<Design> {
     let mut d = Design { dbu: db.tech_get_db_units_per_micron(), ..Design::default() };
     d.die = Rect { lx: db.block_get_die_area_x_min(), ly: db.block_get_die_area_y_min(), ux: db.block_get_die_area_x_max(), uy: db.block_get_die_area_y_max() };
@@ -164,6 +190,7 @@ fn physical_core_count() -> usize {
 fn run(job: &Value) -> Result<Value, String> {
     let mut db: Option<Db> = None;
     let mut threads = vyges_gpl::run::Threads { asked: 1, cores: physical_core_count() };
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
     let mut log = Log::default();
     let finish = |log: Log, stop: Option<String>, extra: Value| {
         let (status, reason) = match stop {
@@ -193,15 +220,45 @@ fn run(job: &Value) -> Result<Value, String> {
                     let level: i32 = level.parse().map_err(|_| Stop::Refused(format!("set_debug_level {level}: not an integer")))?;
                     log.debug.insert((tool.clone(), group.clone()), level);
                 }
+                // `placement_cluster`: its names (one list, or several), each found as `get_cells`
+                // finds an exact name (GPL-0095 when none is), GPL-0096; kept for the placer.
+                "placement_cluster" => {
+                    let db = db.as_ref().ok_or_else(|| Stop::Refused("placement_cluster before read_db".into()))?;
+                    let names: Vec<String> = args.iter().flat_map(|a| a.split_whitespace()).map(|n| n.trim_matches(|c| c == '{' || c == '}').to_string()).filter(|n| !n.is_empty()).collect();
+                    if names.is_empty() {
+                        return log.error("GPL", 94, "placement_cluster requires a list of instances.");
+                    }
+                    if names.iter().any(|n| n.contains(['*', '?'])) {
+                        return refuse("placement_cluster with a wildcard pattern is not modelled");
+                    }
+                    let all = db.block_get_insts();
+                    let ix: std::collections::HashMap<&str, usize> = all.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+                    let mut members = Vec::new();
+                    for n in &names {
+                        match ix.get(n.as_str()) {
+                            Some(&k) => members.push(k),
+                            None => return log.error("GPL", 95, format!("Instances {{{n}}} for placement_cluster command were not found.")),
+                        }
+                    }
+                    log.info("GPL", 96, format!("Created placement cluster of {} instances.", members.len()));
+                    clusters.push(members);
+                }
                 "set_thread_count" => {
                     let [n] = args.as_slice() else { return refuse("set_thread_count: needs one count") };
                     threads.asked = n.parse().map_err(|_| Stop::Refused(format!("set_thread_count {n}: not a count")))?;
                 }
                 "global_placement" => {
                     log.lines.clear();
-                    let db = db.as_ref().ok_or_else(|| Stop::Refused("global_placement before read_db".into()))?;
-                    let d = design(db)?;
-                    return vyges_gpl::run::global_placement(&mut log, &d, &args, threads).map(Some);
+                    let dbr = db.as_ref().ok_or_else(|| Stop::Refused("global_placement before read_db".into()))?;
+                    let mut d = design(dbr)?;
+                    d.clusters = clusters.clone();
+                    // A Nesterov run that is not the command's last (incremental placement's first
+                    // pass) writes the database and reports its HPWL there, as the reference does.
+                    let mut hook = |log: &mut Log, locations: &[(usize, i32, i32)]| -> Res<()> {
+                        let db = db.as_mut().expect("read before global_placement");
+                        update_db_and_report_hpwl(db, log, locations).map_err(Stop::Refused)
+                    };
+                    return vyges_gpl::run::global_placement(&mut log, &d, &args, threads, &mut hook).map(Some);
                 }
                 other => return refuse(format!("{other}: not a modelled step")),
             }
@@ -241,28 +298,17 @@ fn run(job: &Value) -> Result<Value, String> {
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 // `updateDbGCells`: each placed instance at its location, PLACED.
                 let db = db.as_mut().expect("read before global_placement");
-                let names = db.block_get_insts();
-                for &(di, x, y) in &locations {
-                    let e = |e: vyges_opendb::Error| format!("{}: {e}", names[di]);
-                    db.inst_set_placement_status(&names[di], "PLACED").map_err(e)?;
-                    db.set_inst_location(&names[di], x, y).map_err(e)?;
-                }
-                // `reportHpwlMetric` (GPL-1018): every non-supply, non-special net's terminal box.
-                let mut hpwl = 0i64;
-                for net in db.block_get_nets() {
-                    let sig = db.net_get_sig_type(&net);
-                    if matches!(sig.as_str(), "POWER" | "GROUND") || db.net_is_special(&net) {
-                        continue;
-                    }
-                    let (x0, y0, x1, y1) = (db.net_get_term_b_box_x_min(&net), db.net_get_term_b_box_y_min(&net), db.net_get_term_b_box_x_max(&net), db.net_get_term_b_box_y_max(&net));
-                    if x0 > x1 || y0 > y1 {
-                        continue;
-                    }
-                    hpwl += i64::from(x1 - x0) + i64::from(y1 - y0);
-                }
-                let dbu = f64::from(db.tech_get_db_units_per_micron());
-                log.info("GPL", 1018, format!("Final HPWL (um): {:.2}", hpwl as f64 / dbu));
+                update_db_and_report_hpwl(db, &mut log, &locations)?;
                 if let Some(path) = job["write_def"].as_str() {
+                    db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
+                }
+                return Ok(finish(log, None, extra));
+            }
+            Ok(Some(Outcome::Unchanged(c, bases))) => {
+                // Incremental placement with every instance placed: nothing moved; the design as read.
+                let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins, "unchanged": true,
+                    "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
+                if let (Some(path), Some(db)) = (job["write_def"].as_str(), db.as_mut()) {
                     db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
                 }
                 return Ok(finish(log, None, extra));
@@ -339,7 +385,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of placed, vacuous, refused or error. placed means the command ran to the end: the initial placement (and, unless -skip_nesterov_place, the Nesterov placement to the target overflow) written to the database. The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion, -incremental, -place_ios, placement clusters."
+    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement and placement clusters, each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion, -place_ios."
   ],
   "invocation": {
     "args_template": ["global_placement", "{job}"],

@@ -139,6 +139,9 @@ pub struct Design {
     /// In `getRegions()` order.
     pub regions: Vec<Region>,
     pub blockages: Vec<Blockage>,
+    /// `placement_cluster` lists, in command order: each a list of database instances that the
+    /// Nesterov placer moves as ONE cell (`NesterovBaseCommon`'s cluster cells).
+    pub clusters: Vec<Vec<usize>>,
 }
 
 /// The options construction reads.
@@ -161,6 +164,9 @@ pub struct Instance {
     pub uy: i32,
     pub fixed: bool,
     pub macro_: bool,
+    /// `Instance::isLocked`: incremental placement locks the instances already PLACED, and a
+    /// converged Nesterov region locks its own; a locked instance does not move.
+    pub locked: bool,
 }
 
 impl Instance {
@@ -266,7 +272,7 @@ pub fn placer_base_common(log: &mut Log, d: &Design, v: &Vars) -> Res<Common> {
             log.warn("GPL", 134, format!("Master {} is not marked as a BLOCK in LEF but is more than {ROW_LIMIT} rows tall.  It will be treated as a macro.", di.master));
         }
         // copyDbLocation: the box, widened by the padding when movable.
-        let mut inst = Instance { db: Some(k), lx: di.bbox.lx, ly: di.bbox.ly, ux: di.bbox.lx + di.bbox.dx(), uy: di.bbox.ly + di.bbox.dy(), fixed: di.fixed, macro_ };
+        let mut inst = Instance { db: Some(k), lx: di.bbox.lx, ly: di.bbox.ly, ux: di.bbox.lx + di.bbox.dx(), uy: di.bbox.ly + di.bbox.dy(), fixed: di.fixed, macro_, locked: false };
         if inst.is_place_instance() {
             inst.lx -= v.pad_left * site_x;
             inst.ux += v.pad_right * site_x;
@@ -544,7 +550,7 @@ fn init_insts_for_unusable_sites(log: &mut Log, d: &Design, c: &Common, b: &Base
                         grid[at(x, y)] = Site::FixedInst;
                     }
                 }
-                dummies.push(Instance { db: None, lx: rb.lx + sx * start, ly: rb.ly + sy * j, ux: rb.lx + sx * end_x, uy: rb.ly + sy * end_y, fixed: true, macro_: false });
+                dummies.push(Instance { db: None, lx: rb.lx + sx * start, ly: rb.ly + sy * j, ux: rb.lx + sx * end_x, uy: rb.ly + sy * end_y, fixed: true, macro_: false, locked: false });
             }
             // The reference's `for` steps past the cell that ended the run.
             i += 1;
@@ -596,7 +602,7 @@ mod tests {
     // Rule (snapOutward): fixed instances snap down at the low side and up at the high side.
     #[test]
     fn fixed_instances_snap_outward() {
-        let mut i = Instance { db: Some(0), lx: 195, ly: 10, ux: 385, uy: 1410, fixed: true, macro_: false };
+        let mut i = Instance { db: Some(0), lx: 195, ly: 10, ux: 385, uy: 1410, fixed: true, macro_: false, locked: false };
         i.snap_outward(0, 0, 190, 1400);
         assert_eq!((i.lx, i.ly, i.ux, i.uy), (190, 0, 570, 2800));
     }
@@ -605,7 +611,7 @@ mod tests {
     // way with integer division.
     #[test]
     fn extension_is_about_the_integer_centre() {
-        let mut i = Instance { db: Some(0), lx: 0, ly: 0, ux: 381, uy: 1400, fixed: false, macro_: false };
+        let mut i = Instance { db: Some(0), lx: 0, ly: 0, ux: 381, uy: 1400, fixed: false, macro_: false, locked: false };
         let delta = i.extend_size_by_scale(1.1);
         assert_eq!((i.lx, i.ux, i.ly, i.uy), (190 - 209, 190 + 209, 700 - 770, 700 + 770));
         assert_eq!(delta, 418 * 1540 - 381 * 1400);

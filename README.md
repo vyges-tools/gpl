@@ -1,11 +1,9 @@
 # vyges-gpl
 
-Global placement. Today the engine builds the placer's view of the design — instances, nets, pins,
-regions, the sites a placement may not use — and runs the initial placement: rounds of a
+Global placement. The engine builds the placer's view of the design — instances, nets, pins,
+regions, the sites a placement may not use — runs the initial placement (rounds of a
 bound-to-bound net model solved by BiCGSTAB, in exactly the arithmetic order of the reference
-solver, so every coordinate matches bit for bit. The Nesterov placement comes next; until then a
-full `global_placement` is refused after the initial placement, and `-skip_nesterov_place`
-places the design.
+solver) and then the Nesterov electrostatic placement, so every coordinate matches bit for bit.
 
 ```sh
 vyges install physical
@@ -47,10 +45,13 @@ and a `status`:
 - the Nesterov (electrostatic) placement: fillers, the pre-placement perturbation, the bin grid,
   the DCT density field, the weighted-average wirelength gradient, the accelerated descent with
   back-tracking and the divergence revert — over the top level and every region group, each
-  region its own density field.
+  region its own density field;
+- incremental placement: the instances already placed held where they are while the new ones
+  settle, then everything released for a second pass;
+- placement clusters: a group of instances moved as one cell, sized to their total area.
 
 Refused rather than guessed: `-timing_driven`, `-routability_driven`, `-virtual_cts`,
-`-incremental`, `-place_ios`, placement clusters.
+`-place_ios`.
 
 ## Build
 

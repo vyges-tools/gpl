@@ -38,6 +38,9 @@ pub enum Outcome {
     /// Nesterov placement ran: the placer, its bases, each placed instance's database location
     /// (design instance, lower-left) and the final iteration.
     Placed(Common, Vec<Base>, Vec<(usize, i32, i32)>, i32),
+    /// Incremental placement found every instance placed (GPL-0156): the command ends with the
+    /// placer built and nothing moved.
+    Unchanged(Common, Vec<Base>),
 }
 
 /// `sta::parse_key_args` then `check_argc_eq0`: exact keys and flags, else the first key, then
@@ -96,8 +99,12 @@ fn placement_threads(log: &mut Log, t: Threads) -> usize {
     t.cores
 }
 
+/// Writes a Nesterov run's placement into the database and reports its HPWL (GPL-1018) — for a
+/// run that is not the command's last.
+pub type DbHook<'a> = &'a mut dyn FnMut(&mut Log, &[(usize, i32, i32)]) -> Res<()>;
+
 /// The `global_placement` proc.
-pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Threads) -> Res<Outcome> {
+pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Threads, hook: DbHook<'_>) -> Res<Outcome> {
     let (keys, flags) = parse_key_args(log, "global_placement", args, KEYS, FLAGS)?;
     let flag = |f: &str| flags.iter().any(|x| x == f);
     if flag("-place_ios") {
@@ -106,9 +113,6 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
                 return log.error("GPL", id, format!("-place_ios cannot be used with {what} placement."));
             }
         }
-    }
-    if flag("-incremental") {
-        return refuse("global_placement -incremental (doIncrementalPlace) is not modelled");
     }
     // replace_initial_place_cmd: the options, then doInitialPlace.
     let int = |k: &str| -> Res<i32> { keys.get(k).map_or(Ok(0), |v| v.trim().parse::<i32>().or_else(|_| refuse(format!("{k} {v}: not an integer")))) };
@@ -129,6 +133,11 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     }
     // The thread count does not change construction; the message is the command's first line.
     let _threads = placement_threads(log, threads);
+    if flag("-incremental") {
+        // replace_incremental_place_cmd: the options, then doIncrementalPlace.
+        let o = nesterov_opts(&keys, &flags, &vars)?;
+        return do_incremental_place(log, d, &vars, &ip, o, hook);
+    }
     let skip_nesterov = flag("-skip_nesterov_place");
     // replace_nesterov_place_cmd's options, checked before any work so a refusal costs nothing.
     let np = if skip_nesterov { None } else { Some(nesterov_opts(&keys, &flags, &vars)?) };
@@ -194,6 +203,67 @@ fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, skip_nest
     }
     let ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
     Ok(Outcome::InitiallyPlaced(common, bases, ip, skip_nesterov))
+}
+
+/// `Replace::doIncrementalPlace`: the placer, with every instance already PLACED locked; the
+/// placed and unplaced counts (GPL-0154/0155) — nothing unplaced ends the command (GPL-0156); then
+/// a rough pass with the locked ones held (overflow at least 0.2, at most 300 iterations, uniform
+/// target density), every instance unlocked (GPL-0133), and — when the asked overflow is lower —
+/// the Nesterov loop continued from the next iteration to it, on the same placer.
+fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: nesterov::Opts, hook: DbHook<'_>) -> Res<Outcome> {
+    check_has_core_rows(log, d)?;
+    log.info("GPL", 83, "Execute incremental mode global placement.");
+    let mut common = placer_base::placer_base_common(log, d, v)?;
+    let (mut placed, mut unplaced) = (0usize, 0usize);
+    let mut pb_of = vec![None; d.insts.len()];
+    for (i, inst) in common.insts.iter().enumerate() {
+        if let Some(k) = inst.db {
+            pb_of[k] = Some(i);
+        }
+    }
+    for (k, di) in d.insts.iter().enumerate() {
+        if di.placed && !di.fixed {
+            // `dbToPb(inst)->lock()`
+            if let Some(i) = pb_of[k] {
+                common.insts[i].locked = true;
+            }
+            placed += 1;
+        } else if !di.placed {
+            unplaced += 1;
+        }
+    }
+    let mut bases = vec![placer_base::placer_base(log, d, &common, None, true)?];
+    for region in &d.regions {
+        for &g in &region.groups {
+            bases.push(placer_base::placer_base(log, d, &common, Some(g), true)?);
+        }
+    }
+    log.info("GPL", 154, format!("Identified {placed} placed instances"));
+    log.info("GPL", 155, format!("Identified {unplaced} not placed instances"));
+    if unplaced == 0 {
+        log.info("GPL", 156, "Identified all instances as placed. Skipping incremental mode");
+        return Ok(Outcome::Unchanged(common, bases));
+    }
+    let mut locked = o.clone();
+    locked.overflow = o.overflow.max(0.2);
+    locked.max_iter = 300;
+    locked.uniform_density = true;
+    // doInitialPlace on the placer that exists: no construction, no GPL-0123.
+    if v.place_ios {
+        return refuse("-place_ios (checkPlaceIosSupported: the die polygon) is not modelled");
+    }
+    let mut ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
+    let mut np = nesterov::init_nesterov_place(log, d, &mut common, &mut ip, &bases, &locked)?;
+    let mut iter = nesterov::do_nesterov_place(log, d, &mut np)?;
+    // `updateDb` then `reportHpwlMetric` at the end of this pass
+    hook(log, &nesterov::placed_locations(&common, &np))?;
+    log.info("GPL", 133, "Unlocking all instances");
+    nesterov::unlock_all(&mut np, &mut common);
+    if o.overflow < locked.overflow {
+        iter = nesterov::continue_nesterov_place(log, d, &mut np, o.overflow, o.max_iter, iter + 1)?;
+    }
+    let locations = nesterov::placed_locations(&common, &np);
+    Ok(Outcome::Placed(common, bases, locations, iter))
 }
 
 /// `checkHasCoreRows` (`dbHasCoreRows`: a row whose site is not a PAD site).

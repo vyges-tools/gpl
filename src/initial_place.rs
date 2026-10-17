@@ -166,6 +166,10 @@ pub fn place_insts_initial_positions(log: &mut Log, d: &Design, c: &mut Common, 
     let (ccx, ccy) = ((d.core.lx + d.core.ux) / 2, (d.core.ly + d.core.uy) / 2);
     let (mut region, mut db, mut core) = (0, 0, 0);
     for &k in &ip.place.clone() {
+        // a locked instance keeps its place and is counted nowhere
+        if c.insts[k].locked {
+            continue;
+        }
         let di = &d.insts[c.insts[k].db.expect("a placed instance is a design instance")];
         let reg = di.group.and_then(|g| d.groups[g].region);
         if let Some(r) = reg {
@@ -261,6 +265,14 @@ pub fn create_sparse_matrix(c: &Common, ip: &Ip, vars: &IpVars) -> (System, Syst
     for (e, &k) in ip.place.iter().enumerate() {
         sx.x[e] = c.insts[k].cx() as f32;
         sy.x[e] = c.insts[k].cy() as f32;
+        // A locked instance is its own row, pinned at its centre (its triplets first, in place
+        // order, before any net's).
+        if c.insts[k].locked {
+            sx.triplets.push((e, e, 1.0));
+            sy.triplets.push((e, e, 1.0));
+            sx.rhs[e] = c.insts[k].cx() as f32;
+            sy.rhs[e] = c.insts[k].cy() as f32;
+        }
     }
     // A pin's instance, when the placer moves it (`isPlaceInstConnected`).
     let placed = |p: &Pin| p.inst.filter(|&k| !c.insts[k].fixed);
@@ -290,15 +302,30 @@ pub fn create_sparse_matrix(c: &Common, ip: &Ip, vars: &IpVars) -> (System, Syst
                     let diff = (c1 - c2).abs();
                     let weight = if diff > vars.min_diff_length { net_weight / diff as f32 } else { net_weight / vars.min_diff_length as f32 };
                     match (placed(p1), placed(p2)) {
-                        (Some(a), Some(b)) => {
-                            let (e1, e2) = (ext[a], ext[b]);
-                            sys.triplets.push((e1, e1, weight));
-                            sys.triplets.push((e2, e2, weight));
-                            sys.triplets.push((e1, e2, -weight));
-                            sys.triplets.push((e2, e1, -weight));
-                            sys.rhs[e1] += -weight * ((c1 - center(a)) - (c2 - center(b))) as f32;
-                            sys.rhs[e2] += -weight * ((c2 - center(b)) - (c1 - center(a))) as f32;
-                        }
+                        (Some(a), Some(b)) => match (c.insts[a].locked, c.insts[b].locked) {
+                            (false, false) => {
+                                let (e1, e2) = (ext[a], ext[b]);
+                                sys.triplets.push((e1, e1, weight));
+                                sys.triplets.push((e2, e2, weight));
+                                sys.triplets.push((e1, e2, -weight));
+                                sys.triplets.push((e2, e1, -weight));
+                                sys.rhs[e1] += -weight * ((c1 - center(a)) - (c2 - center(b))) as f32;
+                                sys.rhs[e2] += -weight * ((c2 - center(b)) - (c1 - center(a))) as f32;
+                            }
+                            // one locked: its pin is a fixed terminal for the other
+                            (true, false) => {
+                                let e2 = ext[b];
+                                sys.triplets.push((e2, e2, weight));
+                                sys.rhs[e2] += weight * (c1 - (c2 - center(b))) as f32;
+                            }
+                            (false, true) => {
+                                let e1 = ext[a];
+                                sys.triplets.push((e1, e1, weight));
+                                sys.rhs[e1] += weight * (c2 - (c1 - center(a))) as f32;
+                            }
+                            // both locked: nothing
+                            (true, true) => {}
+                        },
                         (None, Some(b)) => {
                             let e2 = ext[b];
                             sys.triplets.push((e2, e2, weight));
@@ -354,6 +381,9 @@ pub fn hpwl(d: &Design, c: &Common, ip: &Ip, v: &Vars) -> i64 {
 /// box's lower-left becomes the database location).
 pub fn update_coordi(d: &Design, c: &mut Common, ip: &mut Ip, sx: &[f32], sy: &[f32]) {
     for (e, &k) in ip.place.clone().iter().enumerate() {
+        if c.insts[k].locked {
+            continue;
+        }
         let mut nx = sx[e] as i32;
         let mut ny = sy[e] as i32;
         nx = nx.max(d.core.lx).min(d.core.ux);

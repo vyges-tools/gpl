@@ -103,6 +103,9 @@ pub struct GCell {
     pub density_scale: f32,
     pub pins: Vec<usize>,
     pub locked: bool,
+    /// A placement cluster's instances, in its order (`inst` is the first); empty for a cell of
+    /// one instance or a filler.
+    pub members: Vec<usize>,
 }
 
 impl GCell {
@@ -580,18 +583,51 @@ fn dbu_area(d: &Design, a: f64) -> f64 {
 /// to the placer): one cell per placed instance of the whole design, pins and nets; then per
 /// region its fillers, its perturbation, its bin grid, its FFT, its density sizes.
 pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, bases: &[Base], o: &Opts) -> Res<Nesterov> {
-    // NesterovBaseCommon: one cell per placed instance, pins and nets as the placer holds them.
+    // NesterovBaseCommon: the placement clusters first, each ONE cell of its instances; then one
+    // cell per other placed instance; pins and nets as the placer holds them.
     let mut gcells: Vec<GCell> = Vec::new();
     let mut inst_cell = vec![None; c.insts.len()];
+    let mut pb_of = vec![None; d.insts.len()];
+    for (i, inst) in c.insts.iter().enumerate() {
+        if let Some(k) = inst.db {
+            pb_of[k] = Some(i);
+        }
+    }
+    for cl in &d.clusters {
+        let mut members = Vec::with_capacity(cl.len());
+        for &k in cl {
+            match pb_of[k] {
+                Some(i) if !c.insts[i].fixed => members.push(i),
+                _ => return refuse("a placement cluster holding an instance the placer does not move is not modelled"),
+            }
+        }
+        if members.iter().any(|&m| inst_cell[m].is_some()) {
+            return refuse("an instance in two placement clusters is not modelled");
+        }
+        let gi = gcells.len();
+        for &m in &members {
+            inst_cell[m] = Some(gi);
+        }
+        let first = &c.insts[members[0]];
+        let (lx, ly, ux, uy) = cluster_box(c, &members, d);
+        let locked = members.iter().any(|&m| c.insts[m].locked);
+        let pins = members.iter().flat_map(|&m| ip.inst_pins[m].iter().copied()).collect();
+        gcells.push(GCell { inst: Some(members[0]), macro_: first.macro_, lx, ly, ux, uy, dlx: lx, dly: ly, dux: ux, duy: uy, locked, pins, members, ..GCell::default() });
+    }
     for &k in &ip.place {
+        if inst_cell[k].is_some() {
+            continue;
+        }
         let i = &c.insts[k];
         inst_cell[k] = Some(gcells.len());
-        gcells.push(GCell { inst: Some(k), macro_: i.macro_, lx: i.lx, ly: i.ly, ux: i.ux, uy: i.uy, dlx: i.lx, dly: i.ly, dux: i.ux, duy: i.uy, ..GCell::default() });
+        gcells.push(GCell { inst: Some(k), macro_: i.macro_, lx: i.lx, ly: i.ly, ux: i.ux, uy: i.uy, dlx: i.lx, dly: i.ly, dux: i.ux, duy: i.uy, locked: i.locked, ..GCell::default() });
     }
     let gpins: Vec<GPin> = ip.pins.iter().map(|p| GPin { cx: p.cx, cy: p.cy, off_x: p.off_x, off_y: p.off_y, gcell: p.inst.and_then(|k| inst_cell[k]), ..GPin::default() }).collect();
     for (k, pins) in ip.inst_pins.iter().enumerate() {
         if let Some(g) = inst_cell[k] {
-            gcells[g].pins = pins.clone();
+            if gcells[g].members.is_empty() {
+                gcells[g].pins = pins.clone();
+            }
         }
     }
     let gnets: Vec<GNet> = ip.net_pins.iter().map(|p| GNet { pins: p.clone(), ..GNet::default() }).collect();
@@ -646,7 +682,11 @@ fn nesterov_base(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &
     let fillers = init_filler_gcells(log, d, c, base, &mut nb, &np.o)?;
     perturb_place_insts(d, c, ip, base, inst_cell, &mut np.gcells, &np.o);
     nb.fillers = fillers.len();
-    nb.cells = base.place_insts.iter().map(|&k| inst_cell[k].expect("checked")).collect();
+    // a cluster is added where its first instance comes in the region's order
+    nb.cells = base.place_insts.iter().filter_map(|&k| {
+        let gi = inst_cell[k].expect("checked");
+        np.gcells[gi].members.first().is_none_or(|&m| m == k).then_some(gi)
+    }).collect();
     for f in fillers {
         nb.cells.push(np.gcells.len());
         np.gcells.push(f);
@@ -656,6 +696,29 @@ fn nesterov_base(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &
     update_density_size(&mut np.gcells, &nb);
     probe_init(log, &np.gcells, &nb);
     Ok(nb)
+}
+
+/// `GCell::updateLocations` for a cluster: centred on its instances' bounding box (integer
+/// centre), as wide and high as their total area at the core's aspect ratio (double, truncated
+/// when the box is made).
+fn cluster_box(c: &Common, members: &[usize], d: &Design) -> (i32, i32, i32, i32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    let mut area = 0i64;
+    for &m in members {
+        let i = &c.insts[m];
+        area += i64::from(i.dx()) * i64::from(i.dy());
+        x0 = x0.min(i.lx);
+        y0 = y0.min(i.ly);
+        x1 = x1.max(i.ux);
+        y1 = y1.max(i.uy);
+    }
+    let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+    let aspect = f64::from(d.core.dx()) / f64::from(d.core.dy());
+    let height = (area as f64 / aspect).sqrt();
+    let width = height * aspect;
+    let (ax, ay) = ((f64::from(cx) - width / 2.0) as i32, (f64::from(cy) - height / 2.0) as i32);
+    let (bx, by) = ((f64::from(cx) + width / 2.0) as i32, (f64::from(cy) + height / 2.0) as i32);
+    (ax.min(bx), ay.min(by), ax.max(bx), ay.max(by))
 }
 
 /// `NesterovBase::getNesterovInstsArea`: standard cells, plus macros scaled by the target density
@@ -749,17 +812,45 @@ fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, ins
         } else {
             (0, 0)
         };
-        // `Instance::setLocation`, then its pins (`Pin::updateLocation`).
-        let i = &mut c.insts[k];
-        let (w, h) = (i.dx(), i.dy());
-        i.lx += xo;
-        i.ly += yo;
-        i.ux = i.lx + w;
-        i.uy = i.ly + h;
-        let (icx, icy) = (i.cx(), i.cy());
-        for &p in &ip.inst_pins[k] {
-            ip.pins[p].cx = icx + ip.pins[p].off_x;
-            ip.pins[p].cy = icy + ip.pins[p].off_y;
+        let gi = inst_cell[k].expect("a placed instance");
+        // A cluster is moved once, from its first instance; the others only drew.
+        if gcells[gi].members.first().is_some_and(|&m| m != k) {
+            continue;
+        }
+        let members = if gcells[gi].members.is_empty() { vec![k] } else { gcells[gi].members.clone() };
+        // `Instance::setLocation(pb_inst->lx() + x_offset, ...)` for each instance of the cell, then
+        // its pins (`Pin::updateLocation`) — `pb_inst->lx()` read anew each time, as the reference
+        // reads it (the first instance has already moved when the next is set); a locked instance
+        // stays where it is, though its offset was drawn (the stream stays in step).
+        for &m in &members {
+            if c.insts[m].locked {
+                continue;
+            }
+            let (nx, ny) = (c.insts[k].lx + xo, c.insts[k].ly + yo);
+            let i = &mut c.insts[m];
+            let (w, h) = (i.dx(), i.dy());
+            i.lx = nx;
+            i.ly = ny;
+            i.ux = i.lx + w;
+            i.uy = i.ly + h;
+            let (icx, icy) = (i.cx(), i.cy());
+            for &p in &ip.inst_pins[m] {
+                ip.pins[p].cx = icx + ip.pins[p].off_x;
+                ip.pins[p].cy = icy + ip.pins[p].off_y;
+            }
+        }
+        if !gcells[gi].members.is_empty() {
+            let (lx, ly, ux, uy) = cluster_box(c, &members, d);
+            let cell = &mut gcells[gi];
+            cell.lx = lx;
+            cell.ly = ly;
+            cell.ux = ux;
+            cell.uy = uy;
+            cell.dlx = lx;
+            cell.dly = ly;
+            cell.dux = ux;
+            cell.duy = uy;
+            continue;
         }
         // `GCell::updateLocations` (one instance): the box, density box the same.
         let i = &c.insts[k];
@@ -1506,6 +1597,11 @@ impl Nesterov {
     fn update_initial_prev_slp_coordi(&mut self, b: usize) {
         let c = self.initial_prev_coordi_update_coef;
         for i in 0..self.nbs[b].cells.len() {
+            // a locked cell's previous point is its current one
+            if self.gcells[self.nbs[b].cells[i]].locked {
+                self.nbs[b].prev_slp[i] = self.nbs[b].cur_slp[i];
+                continue;
+            }
             let px = self.nbs[b].cur_slp[i].x - c * self.nbs[b].cur_slp_sum[i].x;
             let py = self.nbs[b].cur_slp[i].y - c * self.nbs[b].cur_slp_sum[i].y;
             let q = FloatPoint::new(self.inside_x(b, i, px), self.inside_y(b, i, py));
@@ -1631,6 +1727,13 @@ impl Nesterov {
         }
         let s = self.nbs[b].step_length;
         for k in 0..self.nbs[b].cells.len() {
+            // a locked cell stays where it is
+            if self.gcells[self.nbs[b].cells[k]].locked {
+                let nb = &mut self.nbs[b];
+                nb.next[k] = nb.cur[k];
+                nb.next_slp[k] = nb.cur_slp[k];
+                continue;
+            }
             let nb = &self.nbs[b];
             let nx = nb.cur_slp[k].x + s * nb.cur_slp_sum[k].x;
             let ny = nb.cur_slp[k].y + s * nb.cur_slp_sum[k].y;
@@ -1746,6 +1849,18 @@ impl Nesterov {
             std::mem::swap(&mut nb.prev_slp_wl, &mut nb.cur_slp_wl);
             std::mem::swap(&mut nb.prev_slp_den, &mut nb.cur_slp_den);
             std::mem::swap(&mut nb.prev_slp_sum, &mut nb.cur_slp_sum);
+            // "Prevent locked instances from moving": a locked instance cell's next state is the
+            // (now) current one — between the two rotations, as the reference does it.
+            for k in 0..nb.cells.len() {
+                let g = &self.gcells[nb.cells[k]];
+                if g.is_instance() && g.locked {
+                    nb.next_slp[k] = nb.cur_slp[k];
+                    nb.next_slp_wl[k] = nb.cur_slp_wl[k];
+                    nb.next_slp_den[k] = nb.cur_slp_den[k];
+                    nb.next_slp_sum[k] = nb.cur_slp_sum[k];
+                    nb.next[k] = nb.cur[k];
+                }
+            }
             std::mem::swap(&mut nb.cur_slp, &mut nb.next_slp);
             std::mem::swap(&mut nb.cur_slp_wl, &mut nb.next_slp_wl);
             std::mem::swap(&mut nb.cur_slp_den, &mut nb.next_slp_den);
@@ -1958,14 +2073,16 @@ impl Nesterov {
 /// `updateDbGCells` writes it — the density centre less half the (padded) instance, plus the
 /// left padding.
 pub fn placed_locations(c: &Common, nb: &Nesterov) -> Vec<(usize, i32, i32)> {
-    nb.gcells
-        .iter()
-        .filter_map(|g| g.inst.map(|k| (k, g)))
-        .map(|(k, g)| {
+    let mut out = Vec::new();
+    for g in nb.gcells.iter().filter(|g| g.inst.is_some()) {
+        // every instance of a cluster at the cluster's centre
+        let members = if g.members.is_empty() { vec![g.inst.expect("an instance cell")] } else { g.members.clone() };
+        for k in members {
             let i = &c.insts[k];
-            (i.db.expect("a placed instance is a design instance"), g.d_cx() - i.dx() / 2 + c.site_x * nb.o.pad_left, g.d_cy() - i.dy() / 2)
-        })
-        .collect()
+            out.push((i.db.expect("a placed instance is a design instance"), g.d_cx() - i.dx() / 2 + c.site_x * nb.o.pad_left, g.d_cy() - i.dy() / 2));
+        }
+    }
+    out
 }
 
 /// `Replace::doNesterovPlace` from GPL-0084 (the placer is built): the reference HPWL, the
@@ -1976,6 +2093,30 @@ pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i3
     let design_hpwl = np.hpwl();
     np.reference_hpwl = if np.o.reference_hpwl > 0.0 { np.o.reference_hpwl } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) };
     np.np_init(log)?;
+    resume_nesterov_place(log, d, np, 0)
+}
+
+/// `Replace::doNesterovPlace` again on the placer that already exists (`initNesterovPlace` finds
+/// it: no new placer, no init — only the target overflow and the iteration limit are set anew),
+/// the loop from `start_iter`. Incremental placement's second pass.
+pub fn continue_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, overflow: f32, max_iter: i32, start_iter: i32) -> Res<i32> {
+    np.o.overflow = overflow;
+    np.max_iter = max_iter;
+    resume_nesterov_place(log, d, np, start_iter)
+}
+
+/// `PlacerBase::unlockAll` for every region: no cell (and no instance) locked.
+pub fn unlock_all(np: &mut Nesterov, c: &mut Common) {
+    for g in np.gcells.iter_mut().filter(|g| g.is_instance()) {
+        g.locked = false;
+    }
+    for i in c.insts.iter_mut() {
+        i.locked = false;
+    }
+}
+
+/// `NesterovPlace::doNesterovPlace(start_iter)` with GPL-0084 before it.
+fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_iter: i32) -> Res<i32> {
     log.info("GPL", 84, "---- Execute Nesterov Global Placement.");
     if np.num_region_diverged > 0 {
         let (code, msg) = np.diverge.unwrap_or((0, ""));
@@ -1991,7 +2132,7 @@ pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i3
     }
     let (mut saved, mut snap) = (false, (0f32, 0f32));
     let mut cur_a = 1.0f32;
-    let mut iter = 0;
+    let mut iter = start_iter;
     while iter < np.max_iter {
         let prev_a = cur_a;
         cur_a = ((1.0 + (4.0 * f64::from(prev_a) * f64::from(prev_a) + 1.0).sqrt()) * 0.5) as f32;
@@ -2032,6 +2173,21 @@ pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cluster cell is not its instances' bounding box: it is centred on that box's integer
+    /// centre and holds their total area at the core's aspect ratio, each side truncated.
+    #[test]
+    fn cluster_box_is_the_total_area_at_the_core_aspect() {
+        use crate::placer_base::{Instance, Rect};
+        let inst = |lx, ly, ux, uy| Instance { db: None, lx, ly, ux, uy, fixed: false, macro_: false, locked: false };
+        let c = Common { site_x: 1, site_y: 1, insts: vec![inst(0, 0, 10, 10), inst(31, 0, 41, 10)], nets: vec![], pins: 0 };
+        let d = Design { core: Rect { lx: 0, ly: 0, ux: 200, uy: 100 }, ..Design::default() };
+        // bbox (0,0)-(41,10): centre (20, 5); area 200 at aspect 2 is 20 x 10 — not 41 x 10
+        assert_eq!(cluster_box(&c, &[0, 1], &d), (10, 0, 30, 10));
+        // area 3: height sqrt(1.5) = 1.2247, width 2.4495 about (0, 0): each end truncated toward 0
+        let c = Common { insts: vec![inst(-1, -1, 2, 0)], ..c };
+        assert_eq!(cluster_box(&c, &[0], &d), (-1, 0, 1, 0));
+    }
 
     /// Rule (`fastExp`): `(1 + x/1024)` squared ten times, in float — not `exp`.
     #[test]
