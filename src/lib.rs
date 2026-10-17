@@ -11,11 +11,15 @@
 //! - [`ooura`]: the 2-D cosine/sine transforms of the density solver.
 
 pub mod bicgstab;
+#[cfg(feature = "cli")]
+pub mod db_router;
 pub mod initial_place;
 pub mod ld;
 pub mod log;
 pub mod nesterov;
 pub mod normal;
 pub mod ooura;
+pub mod order;
 pub mod placer_base;
+pub mod route_base;
 pub mod run;

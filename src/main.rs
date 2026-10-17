@@ -19,33 +19,20 @@ fn e(err: vyges_opendb::Error) -> Stop {
     Stop::Refused(format!("database: {err}"))
 }
 
-/// The design as `PlacerBaseCommon` / `PlacerBase` read it, in the block's own orders.
-/// `updateDbGCells` then `reportHpwlMetric`: each placed instance at its location, PLACED; then
-/// GPL-1018 over every non-supply, non-special net's terminal box in the database.
+/// `updateDbGCells` then `reportHpwlMetric`: each instance written where the placer has it, then
+/// GPL-1018.
 fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i32, i32)]) -> Result<(), String> {
-    let names = db.block_get_insts();
-    for &(di, x, y) in locations {
-        let e = |e: vyges_opendb::Error| format!("{}: {e}", names[di]);
-        db.inst_set_placement_status(&names[di], "PLACED").map_err(e)?;
-        db.set_inst_location(&names[di], x, y).map_err(e)?;
-    }
-    let mut hpwl = 0i64;
-    for net in db.block_get_nets() {
-        let sig = db.net_get_sig_type(&net);
-        if matches!(sig.as_str(), "POWER" | "GROUND") || db.net_is_special(&net) {
-            continue;
-        }
-        let (x0, y0, x1, y1) = (db.net_get_term_b_box_x_min(&net), db.net_get_term_b_box_y_min(&net), db.net_get_term_b_box_x_max(&net), db.net_get_term_b_box_y_max(&net));
-        if x0 > x1 || y0 > y1 {
-            continue;
-        }
-        hpwl += i64::from(x1 - x0) + i64::from(y1 - y0);
-    }
-    let dbu = f64::from(db.tech_get_db_units_per_micron());
-    log.info("GPL", 1018, format!("Final HPWL (um): {:.2}", hpwl as f64 / dbu));
-    Ok(())
+    use vyges_gpl::route_base::Router;
+    let mut r = vyges_gpl::db_router::DbRouter::new(db);
+    let stop = |s: Stop| match s {
+        Stop::Refused(m) => m,
+        Stop::Error { tool, id } => format!("{tool}-{id:04}"),
+    };
+    r.write_locations(log, locations).map_err(stop)?;
+    r.report_hpwl(log).map_err(stop)
 }
 
+/// The design as `PlacerBaseCommon` / `PlacerBase` read it, in the block's own orders.
 fn design(db: &Db) -> Res<Design> {
     let mut d = Design { dbu: db.tech_get_db_units_per_micron(), ..Design::default() };
     d.die = Rect { lx: db.block_get_die_area_x_min(), ly: db.block_get_die_area_y_min(), ux: db.block_get_die_area_x_max(), uy: db.block_get_die_area_y_max() };
@@ -252,13 +239,10 @@ fn run(job: &Value) -> Result<Value, String> {
                     let dbr = db.as_ref().ok_or_else(|| Stop::Refused("global_placement before read_db".into()))?;
                     let mut d = design(dbr)?;
                     d.clusters = clusters.clone();
-                    // A Nesterov run that is not the command's last (incremental placement's first
-                    // pass) writes the database and reports its HPWL there, as the reference does.
-                    let mut hook = |log: &mut Log, locations: &[(usize, i32, i32)]| -> Res<()> {
-                        let db = db.as_mut().expect("read before global_placement");
-                        update_db_and_report_hpwl(db, log, locations).map_err(Stop::Refused)
-                    };
-                    return vyges_gpl::run::global_placement(&mut log, &d, &args, threads, &mut hook).map(Some);
+                    // The database the run writes mid-command: incremental placement's first pass
+                    // (and its HPWL), routability's congestion passes.
+                    let mut router = vyges_gpl::db_router::DbRouter::new(db.as_mut().expect("read before global_placement"));
+                    return vyges_gpl::run::global_placement(&mut log, &d, &args, threads, Some(&mut router)).map(Some);
                 }
                 other => return refuse(format!("{other}: not a modelled step")),
             }
@@ -385,7 +369,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of placed, vacuous, refused or error. placed means the command ran to the end: the initial placement (and, unless -skip_nesterov_place, the Nesterov placement to the target overflow) written to the database. The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement and placement clusters, each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion, -place_ios."
+    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement, placement clusters and routability-driven placement (RUDY or the global router: cell inflation, filler removal, net reweighting, the revert to the best pass), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -virtual_cts, -enable_routing_congestion, -place_ios."
   ],
   "invocation": {
     "args_template": ["global_placement", "{job}"],

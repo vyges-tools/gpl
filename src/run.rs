@@ -10,6 +10,7 @@ use crate::log::{refuse, Log, Res};
 use crate::initial_place::{self, Ip, IpVars};
 use crate::nesterov;
 use crate::placer_base::{self, Base, Common, Design, Vars};
+use crate::route_base::{RouteBase, RouteVars, Router};
 use std::collections::BTreeMap;
 
 const KEYS: &[&str] = &[
@@ -99,12 +100,8 @@ fn placement_threads(log: &mut Log, t: Threads) -> usize {
     t.cores
 }
 
-/// Writes a Nesterov run's placement into the database and reports its HPWL (GPL-1018) — for a
-/// run that is not the command's last.
-pub type DbHook<'a> = &'a mut dyn FnMut(&mut Log, &[(usize, i32, i32)]) -> Res<()>;
-
 /// The `global_placement` proc.
-pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Threads, hook: DbHook<'_>) -> Res<Outcome> {
+pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Threads, router: Option<&mut dyn Router>) -> Res<Outcome> {
     let (keys, flags) = parse_key_args(log, "global_placement", args, KEYS, FLAGS)?;
     let flag = |f: &str| flags.iter().any(|x| x == f);
     if flag("-place_ios") {
@@ -136,7 +133,10 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     if flag("-incremental") {
         // replace_incremental_place_cmd: the options, then doIncrementalPlace.
         let o = nesterov_opts(&keys, &flags, &vars)?;
-        return do_incremental_place(log, d, &vars, &ip, o, hook);
+        if o.routability.is_some() {
+            return refuse("-routability_driven with -incremental is not modelled");
+        }
+        return do_incremental_place(log, d, &vars, &ip, o, router);
     }
     let skip_nesterov = flag("-skip_nesterov_place");
     // replace_nesterov_place_cmd's options, checked before any work so a refusal costs nothing.
@@ -145,7 +145,17 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     match (outcome, np) {
         (Outcome::InitiallyPlaced(mut c, bases, mut ip, false), Some(o)) => {
             let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases, &o)?;
-            let iter = nesterov::do_nesterov_place(log, d, &mut nb)?;
+            let iter = match (o.routability, router) {
+                (Some(vars), Some(router)) => {
+                    // `RouteBase` is built with the placer; RUDY's router on its first pass
+                    let mut rb = RouteBase::new(vars);
+                    nb.route_base_init(&mut rb);
+                    let mut r = nesterov::Routability { rb, router, common: &c };
+                    nesterov::do_nesterov_place(log, d, &mut nb, Some(&mut r))?
+                }
+                (Some(_), None) => return refuse("-routability_driven needs the design database's router"),
+                (None, _) => nesterov::do_nesterov_place(log, d, &mut nb, None)?,
+            };
             let locations = nesterov::placed_locations(&c, &nb);
             Ok(Outcome::Placed(c, bases, locations, iter))
         }
@@ -155,7 +165,7 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
 
 /// `getOptions` for the plain Nesterov mode; the modes it does not model are refused.
 fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) -> Res<nesterov::Opts> {
-    for f in ["-timing_driven", "-timing_driven_repair_timing", "-routability_driven", "-virtual_cts", "-enable_routing_congestion"] {
+    for f in ["-timing_driven", "-timing_driven_repair_timing", "-virtual_cts", "-enable_routing_congestion"] {
         if flags.iter().any(|x| x == f) {
             return refuse(format!("global_placement {f} is not modelled"));
         }
@@ -181,6 +191,26 @@ fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) ->
     o.perturb_dist = float("-perturb_dist", o.perturb_dist)?;
     o.disable_revert_if_diverge = flags.iter().any(|x| x == "-disable_revert_if_diverge");
     o.pad_left = v.pad_left;
+    o.routability_end_overflow = float("-routability_check_overflow", o.routability_end_overflow)?;
+    o.routability_snapshot_overflow = float("-routability_snapshot_overflow", o.routability_snapshot_overflow)?;
+    // `-routability_driven`, unless `skipIo()` turned it off
+    if flags.iter().any(|x| x == "-routability_driven") && !v.skip_io {
+        let mut r = RouteVars { use_rudy: !flags.iter().any(|x| x == "-routability_use_grt"), ..RouteVars::default() };
+        r.target_rc = float("-routability_target_rc_metric", r.target_rc)?;
+        r.max_density = float("-routability_max_density", r.max_density)?;
+        r.inflation_ratio_coef = float("-routability_inflation_ratio_coef", r.inflation_ratio_coef)?;
+        r.max_inflation_ratio = float("-routability_max_inflation_ratio", r.max_inflation_ratio)?;
+        r.min_congestion_for_inflation = float("-routability_min_congestion_for_inflation", r.min_congestion_for_inflation)?;
+        r.max_inflation_total = float("-routability_max_inflation_total", r.max_inflation_total)?;
+        r.net_weight_max = float("-routability_net_weight_max", r.net_weight_max)?;
+        r.congested_nets_percentage = float("-routability_congested_nets_percentage", r.congested_nets_percentage)?;
+        if let Some(list) = keys.get("-routability_rc_coefficients") {
+            let k: Vec<f32> = list.split_whitespace().map(str::parse::<f32>).collect::<Result<_, _>>().or_else(|_| refuse(format!("-routability_rc_coefficients {list}: not four numbers")))?;
+            let [a, b, c, e] = k[..] else { return refuse(format!("-routability_rc_coefficients {list}: not four numbers")) };
+            r.rc_k = [a, b, c, e];
+        }
+        o.routability = Some(r);
+    }
     Ok(o)
 }
 
@@ -210,7 +240,7 @@ fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, skip_nest
 /// a rough pass with the locked ones held (overflow at least 0.2, at most 300 iterations, uniform
 /// target density), every instance unlocked (GPL-0133), and — when the asked overflow is lower —
 /// the Nesterov loop continued from the next iteration to it, on the same placer.
-fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: nesterov::Opts, hook: DbHook<'_>) -> Res<Outcome> {
+fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: nesterov::Opts, router: Option<&mut dyn Router>) -> Res<Outcome> {
     check_has_core_rows(log, d)?;
     log.info("GPL", 83, "Execute incremental mode global placement.");
     let mut common = placer_base::placer_base_common(log, d, v)?;
@@ -254,9 +284,11 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     }
     let mut ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
     let mut np = nesterov::init_nesterov_place(log, d, &mut common, &mut ip, &bases, &locked)?;
-    let mut iter = nesterov::do_nesterov_place(log, d, &mut np)?;
+    let mut iter = nesterov::do_nesterov_place(log, d, &mut np, None)?;
     // `updateDb` then `reportHpwlMetric` at the end of this pass
-    hook(log, &nesterov::placed_locations(&common, &np))?;
+    let Some(router) = router else { return refuse("-incremental needs the design database to write between its passes") };
+    router.write_locations(log, &nesterov::placed_locations(&common, &np))?;
+    router.report_hpwl(log)?;
     log.info("GPL", 133, "Unlocking all instances");
     nesterov::unlock_all(&mut np, &mut common);
     if o.overflow < locked.overflow {

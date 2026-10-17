@@ -388,6 +388,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
+name = "vyges-est"
+version = "0.1.41"
+dependencies = [
+ "vyges-opendb",
+]
+
+[[package]]
 name = "vyges-events"
 version = "0.1.41"
 source = "git+https://github.com/vyges-tools/events.git?branch=main#dc62f630beaa55f7b3bc25f4cf93192c63c5786d"
@@ -407,7 +414,18 @@ version = "0.1.41"
 dependencies = [
  "serde_json",
  "vyges-events",
+ "vyges-grt",
  "vyges-opendb",
+ "vyges-stt",
+]
+
+[[package]]
+name = "vyges-grt"
+version = "0.1.41"
+dependencies = [
+ "vyges-est",
+ "vyges-opendb",
+ "vyges-sta",
 ]
 
 [[package]]
@@ -443,6 +461,18 @@ dependencies = [
  "cmake",
  "cxx",
  "cxx-build",
+]
+
+[[package]]
+name = "vyges-sta"
+version = "0.1.41"
+
+[[package]]
+name = "vyges-stt"
+version = "0.1.41"
+dependencies = [
+ "serde_json",
+ "vyges-events",
 ]
 
 [[package]]

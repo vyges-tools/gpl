@@ -24,9 +24,11 @@ MODELLED:
   weighted-average wirelength gradient, the accelerated descent with back-tracking, every
   progress row, convergence (GPL-1001..1009) and the final area and HPWL (GPL-1014, 1018) —
   all in the reference's own operation order; region groups each their own Nesterov region
-  (GPL-1016); -incremental (GPL-0083, 0154..0156, 0133); placement_cluster (GPL-0094..0096).
-  Refused: -timing_driven, -routability_driven, -virtual_cts, -enable_routing_congestion,
-  -place_ios.
+  (GPL-1016); -incremental (GPL-0083, 0154..0156, 0133); placement_cluster (GPL-0094..0096);
+  -routability_driven with RUDY or -routability_use_grt: every pass, cell inflation, filler
+  removal and restore, congested-net reweighting, the budget and the revert to the minimum
+  (GPL-0038..0099, 1005, 1011, 1012, 1017). Refused: -timing_driven, -virtual_cts,
+  -enable_routing_congestion, -place_ios.
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout

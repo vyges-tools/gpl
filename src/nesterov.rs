@@ -26,6 +26,7 @@ use crate::normal::{normal, Mt19937};
 use crate::ooura;
 use crate::placer_base::{Base, Common, Design};
 use crate::initial_place::Ip;
+use crate::route_base::{RouteBase, RouteVars, Router};
 
 /// `PlaceOptions` as the plain Nesterov mode reads them.
 #[derive(Debug, Clone)]
@@ -44,6 +45,11 @@ pub struct Opts {
     pub perturb_dist: f32,
     pub disable_revert_if_diverge: bool,
     pub pad_left: i32,
+    /// `routability_driven_mode`, with `RouteBaseVars`.
+    pub routability: Option<RouteVars>,
+    /// `routability_end_overflow` (`-routability_check_overflow`).
+    pub routability_end_overflow: f32,
+    pub routability_snapshot_overflow: f32,
 }
 
 impl Default for Opts {
@@ -63,6 +69,9 @@ impl Default for Opts {
             perturb_dist: -1.0,
             disable_revert_if_diverge: false,
             pad_left: 0,
+            routability: None,
+            routability_end_overflow: 0.3,
+            routability_snapshot_overflow: 0.6,
         }
     }
 }
@@ -185,12 +194,14 @@ pub struct GNet {
     y_min_y: f32,
     max_y: f32,
     y_max_y: f32,
+    /// `customWeight_`: 1 unless routability reweights the net.
+    custom_weight: f32,
 }
 
 impl GNet {
-    /// `GNet::getTotalWeight`: timing × custom, both 1 in the plain mode.
+    /// `GNet::getTotalWeight`: timing (1, no timing-driven mode) × custom.
     fn total_weight(&self) -> f32 {
-        1.0
+        1.0f32 * self.custom_weight
     }
     fn hpwl(&self) -> i64 {
         if self.ux < self.lx {
@@ -415,9 +426,19 @@ pub struct Nb {
     pub target_density: f32,
     uniform_target_density: f32,
     white_space_area: i64,
+    /// `movableArea_` and `totalFillerArea_`: what the target density allows, and its share left
+    /// to the fillers.
+    movable_area: i64,
+    total_filler_area: i64,
     std_insts_area: i64,
     macro_insts_area: i64,
     non_place_insts_area: i64,
+    /// The region's fixed instances and dummies, and the DBU — what `updateBinsNonPlaceArea`
+    /// reads again when the target density changes.
+    fixed: Vec<crate::placer_base::Instance>,
+    dbu: i32,
+    /// `removed_fillers_`: the fillers routability took out, with their state, in removal order.
+    removed_fillers: Vec<RemovedFiller>,
     max_phi_coef: f32,
     max_phi_coef_changed: bool,
     cur_slp: Vec<FloatPoint>,
@@ -453,11 +474,76 @@ pub struct Nb {
     min_sum_overflow: f32,
     hpwl_with_min_sum_overflow: f32,
     coordi_distance: f32,
+    /// `peak_coordi_distance_`: the largest step distance seen — `isSettled` compares against it.
+    peak_coordi_distance: f32,
+    /// `reprint_iter_header_`: the progress header again at the next reported row (after a
+    /// routability pass).
+    reprint_header: bool,
     is_converged: bool,
     is_diverged: bool,
 }
 
 impl Nb {
+    /// The per-cell vectors, in `RemovedFillerState`'s order.
+    fn per_cell(&mut self) -> [&mut Vec<FloatPoint>; 14] {
+        [
+            &mut self.cur_slp,
+            &mut self.cur_slp_wl,
+            &mut self.cur_slp_den,
+            &mut self.cur_slp_sum,
+            &mut self.next_slp,
+            &mut self.next_slp_wl,
+            &mut self.next_slp_den,
+            &mut self.next_slp_sum,
+            &mut self.prev_slp,
+            &mut self.prev_slp_wl,
+            &mut self.prev_slp_den,
+            &mut self.prev_slp_sum,
+            &mut self.cur,
+            &mut self.next,
+        ]
+    }
+
+    fn snapshots(&mut self) -> [&mut Vec<FloatPoint>; 4] {
+        [&mut self.snapshot, &mut self.snapshot_slp, &mut self.snapshot_slp_sum, &mut self.snapshot_prev_slp_sum]
+    }
+
+    /// `destroyFillerGCell`: the cell at `i` swapped with the last and popped — the cell list and
+    /// every per-cell vector alike (`swapAndPopParallelVectors`).
+    fn swap_pop(&mut self, i: usize) -> RemovedFiller {
+        let cell = self.cells.swap_remove(i);
+        let mut vals = [FloatPoint::default(); 14];
+        for (v, slot) in self.per_cell().into_iter().zip(vals.iter_mut()) {
+            *slot = v.swap_remove(i);
+        }
+        let snapshot = if self.snapshot.len() > i {
+            let mut s = [FloatPoint::default(); 4];
+            for (v, slot) in self.snapshots().into_iter().zip(s.iter_mut()) {
+                *slot = v.swap_remove(i);
+            }
+            Some(s)
+        } else {
+            None
+        };
+        RemovedFiller { cell, vals, snapshot }
+    }
+
+    /// `restoreRemovedFillers`' per filler: appended, with its values (`appendParallelVectors`
+    /// grows the snapshot vectors only when they are as long as the others).
+    fn push_back(&mut self, f: &RemovedFiller) {
+        let grow_snapshot = self.snapshot.len() == self.cur_slp.len();
+        self.cells.push(f.cell);
+        for (v, &x) in self.per_cell().into_iter().zip(f.vals.iter()) {
+            v.push(x);
+        }
+        if grow_snapshot {
+            let s = f.snapshot.unwrap_or_default();
+            for (v, &x) in self.snapshots().into_iter().zip(s.iter()) {
+                v.push(x);
+            }
+        }
+    }
+
     fn new(base: &Base, group: Option<String>, o: &Opts) -> Nb {
         Nb {
             cells: vec![],
@@ -469,6 +555,11 @@ impl Nb {
             fillers: 0,
             target_density: 0.0,
             uniform_target_density: 0.0,
+            movable_area: 0,
+            total_filler_area: 0,
+            fixed: vec![],
+            dbu: 0,
+            removed_fillers: vec![],
             white_space_area: 0,
             std_insts_area: base.std_insts_area,
             macro_insts_area: base.macro_insts_area,
@@ -508,6 +599,8 @@ impl Nb {
             min_sum_overflow: 1e30,
             hpwl_with_min_sum_overflow: 1e30,
             coordi_distance: 0.0,
+            peak_coordi_distance: 0.0,
+            reprint_header: false,
             is_converged: false,
             is_diverged: false,
         }
@@ -516,6 +609,15 @@ impl Nb {
 
 /// The placer's whole Nesterov state: `NesterovBaseCommon` (every placed instance's cell, the pins
 /// and nets — then each region's fillers, appended), the regions' `NesterovBase`s, and
+/// `RemovedFillerState`: a filler routability took out — its cell and its value in every
+/// per-cell vector, for `restoreRemovedFillers` to put back.
+#[derive(Debug, Clone)]
+struct RemovedFiller {
+    cell: usize,
+    vals: [FloatPoint; 14],
+    snapshot: Option<[FloatPoint; 4]>,
+}
+
 /// `NesterovPlace`'s loop variables.
 #[derive(Debug, Clone)]
 pub struct Nesterov {
@@ -543,6 +645,10 @@ pub struct Nesterov {
     diverge_snapshot_overflow: f32,
     num_region_diverged: i32,
     diverge: Option<(u32, &'static str)>,
+    /// `is_routability_need_`.
+    routability_need: bool,
+    /// `minRcCellSize_`: each standard instance cell's size at the minimum congestion so far.
+    min_rc_cell_size: Vec<(i32, i32)>,
 }
 
 /// A float point vector's FNV-1a (x then y, each little-endian) — the reference probe's.
@@ -630,7 +736,7 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
             }
         }
     }
-    let gnets: Vec<GNet> = ip.net_pins.iter().map(|p| GNet { pins: p.clone(), ..GNet::default() }).collect();
+    let gnets: Vec<GNet> = ip.net_pins.iter().map(|p| GNet { pins: p.clone(), custom_weight: 1.0, ..GNet::default() }).collect();
     let mut pin_net = vec![0usize; ip.pins.len()];
     for (n, pins) in ip.net_pins.iter().enumerate() {
         for &p in pins {
@@ -664,6 +770,8 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         diverge_snapshot_overflow: 0.0,
         num_region_diverged: 0,
         diverge: None,
+        routability_need: true,
+        min_rc_cell_size: vec![],
     };
     for base in bases {
         let nb = nesterov_base(log, d, c, ip, base, &inst_cell, &mut np)?;
@@ -779,6 +887,8 @@ fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &m
         nb.filler_dx = nb.filler_dx.min(max_x);
         nb.filler_dy = nb.filler_dy.min(max_y);
     }
+    nb.movable_area = movable;
+    nb.total_filler_area = total_filler;
     let count = (total_filler / i64::from(nb.filler_dx.wrapping_mul(nb.filler_dy))) as i32;
     let mut rng = Mt19937::new(0);
     let r = base.region_bbox;
@@ -933,7 +1043,9 @@ fn init_bins(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &mut Nb, o:
     log.info("GPL", 30, format!("Number of bins:             {:10}", bg.bins.len()));
     nb.bg = bg;
     // Only initialised once.
-    update_bins_non_place_area(c, base, nb, d.dbu);
+    nb.fixed = base.fixed_insts.iter().map(|&k| c.insts[k].clone()).chain(base.dummies.iter().cloned()).collect();
+    nb.dbu = d.dbu;
+    update_bins_non_place_area(nb);
 }
 
 /// The area a union of rectangles covers (coordinate compression; exact).
@@ -992,8 +1104,8 @@ fn overlap_area(b: &Bin, i: &crate::placer_base::Instance, dbu: i32) -> i64 {
 /// `BinGrid::updateBinsNonPlaceArea`: each bin's fixed area — the union of the fixed instances in
 /// it (unscaled), and their per-instance areas scaled by the target density, capped at 1.10 times
 /// the scaled union.
-fn update_bins_non_place_area(c: &Common, base: &Base, nb: &mut Nb, dbu: i32) {
-    let fixed: Vec<crate::placer_base::Instance> = base.fixed_insts.iter().map(|&k| c.insts[k].clone()).chain(base.dummies.iter().cloned()).collect();
+fn update_bins_non_place_area(nb: &mut Nb) {
+    let (fixed, dbu) = (&nb.fixed, nb.dbu);
     let bg = &mut nb.bg;
     for b in bg.bins.iter_mut() {
         b.non_place = 0;
@@ -1029,7 +1141,7 @@ fn update_bins_non_place_area(c: &Common, base: &Base, nb: &mut Nb, dbu: i32) {
         bg.bins[b].non_place_unscaled = (union[b] as f32 * td) as i64;
     }
     let mut raw = vec![0i64; n];
-    for i in &fixed {
+    for i in fixed.iter() {
         let (x0, x1) = bg.idx_x(i.lx, i.ux);
         let (y0, y1) = bg.idx_y(i.ly, i.uy);
         for y in y0..y1 {
@@ -1130,6 +1242,25 @@ fn fmt_e(v: f64, prec: usize, width: usize) -> String {
 }
 
 /// fmt's `{:g}`: six significant digits, the shorter of fixed and exponent form, no trailing zeros.
+/// C's `%.<p>g`: scientific when the exponent of the rounded `%e` form is below -4 or at least
+/// `p`, else fixed with `p - 1 - exponent` decimals; trailing zeros dropped either way.
+fn fmt_g_prec(v: f64, p: usize) -> String {
+    if v == 0.0 {
+        return "0".into();
+    }
+    let p = p.max(1);
+    let strip = |s: &str| -> String { if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s.to_string() } };
+    let e_form = format!("{v:.prec$e}", prec = p - 1);
+    let (m, e) = e_form.split_once('e').unwrap_or((&e_form, "0"));
+    let x: i32 = e.parse().unwrap_or(0);
+    if x < -4 || x >= p as i32 {
+        format!("{}e{}{:02}", strip(m), if x < 0 { '-' } else { '+' }, x.abs())
+    } else {
+        let decimals = (p as i32 - 1 - x).max(0) as usize;
+        strip(&format!("{v:.decimals$}"))
+    }
+}
+
 fn fmt_g(v: f64) -> String {
     if v == 0.0 {
         return "0".into();
@@ -1881,10 +2012,13 @@ impl Nesterov {
             nb.prev_reported_hpwl = hpwl;
             nb.prev_reported_overflow_unscaled = nb.sum_overflow_unscaled;
             let group = nb.group.as_ref().map(|g| format!(" ({g})")).unwrap_or_default();
-            if iter == 0 && nb.group.is_none() {
-                log.info("GPL", 31, "HPWL: Half-Perimeter Wirelength");
+            if (iter == 0 || nb.reprint_header) && nb.group.is_none() {
+                if iter == 0 {
+                    log.info("GPL", 31, "HPWL: Half-Perimeter Wirelength");
+                }
                 log.report(format!("{:>9} | {:>8} | {:>13} | {:>8} | {:>9} | {:>5}", "Iteration", "Overflow", "HPWL (um)", "HPWL(%)", "Penalty", "Group"));
                 log.report("---------------------------------------------------------------");
+                nb.reprint_header = false;
             }
             log.report(format!("{iter:9} | {:8.4} | {} | {:+7.2}% | {} | {:>5}", nb.sum_overflow_unscaled, fmt_e(hpwl as f64 / f64::from(d.dbu), 6, 13), pct, fmt_e(f64::from(nb.density_penalty), 2, 9), group));
         }
@@ -1893,6 +2027,7 @@ impl Nesterov {
         let nb = &mut self.nbs[b];
         nb.density_penalty *= phi;
         nb.prev_hpwl = hpwl;
+        nb.peak_coordi_distance = nb.peak_coordi_distance.max(nb.coordi_distance);
         if iter > 50 && nb.min_sum_overflow > nb.sum_overflow_unscaled {
             nb.min_sum_overflow = nb.sum_overflow_unscaled;
             nb.hpwl_with_min_sum_overflow = nb.prev_hpwl as f32;
@@ -1989,7 +2124,9 @@ impl Nesterov {
         for b in 0..self.nbs.len() {
             self.num_region_diverged += i32::from(self.check_divergence(log, b));
         }
-        if !self.o.disable_revert_if_diverge && self.num_region_diverged == 0 && self.is_min_hpwl {
+        // no divergence snapshot while routability may still revert to its own
+        let routability_settled = self.o.routability.is_none() || !self.routability_need;
+        if !self.o.disable_revert_if_diverge && self.num_region_diverged == 0 && routability_settled && self.is_min_hpwl {
             *snap = (self.wl_coef_x, self.wl_coef_y);
             for b in 0..self.nbs.len() {
                 self.save_snapshot(b);
@@ -2019,12 +2156,12 @@ impl Nesterov {
     /// `NesterovBase::checkConvergence`: at the target overflow, the closing row (a region's named),
     /// GPL-1001 (the top level) or GPL-1016 (a region), GPL-1002..1009, the region's instance cells
     /// locked.
-    fn check_convergence(&mut self, log: &mut Log, d: &Design, b: usize, iter: i32) -> bool {
+    fn check_convergence(&mut self, log: &mut Log, d: &Design, b: usize, iter: i32, route: &mut Option<&mut Routability<'_>>, route_iters: i32) -> Res<bool> {
         if self.nbs[b].is_converged {
-            return true;
+            return Ok(true);
         }
         if self.nbs[b].sum_overflow_unscaled > self.o.overflow {
-            return false;
+            return Ok(false);
         }
         let hpwl = self.hpwl();
         let nb = &self.nbs[b];
@@ -2033,8 +2170,20 @@ impl Nesterov {
         log.report("---------------------------------------------------------------");
         match &nb.group {
             Some(g) => log.info("GPL", 1016, format!("Region '{g}' placement finished at iteration {iter}")),
-            None => log.info("GPL", 1001, format!("Global placement finished at iteration {iter}")),
+            None => {
+                log.info("GPL", 1001, format!("Global placement finished at iteration {iter}"));
+                if self.o.routability.is_some() {
+                    log.info("GPL", 1017, format!("Routability mode iteration count: {route_iters}"));
+                }
+            }
         }
+        if let Some(r) = route.as_mut() {
+            let (locations, centres) = (placed_locations(r.common, self), self.std_centres());
+            r.rb.calculate_rudy_tiles(log, &mut *r.router, &locations, &centres)?;
+            r.rb.update_rudy_average(log, false);
+            log.info("GPL", 1005, format!("Routability final weighted congestion: {:.4}", r.rb.rudy_average()));
+        }
+        let nb = &self.nbs[b];
         let nia = nesterov_insts_area(nb);
         log.info("GPL", 1002, format!("Placed Cell Area            {:10.4}", dbu_area(d, nia as f64)));
         log.info("GPL", 1003, format!("Available Free Area         {:10.4}", dbu_area(d, nb.white_space_area as f64)));
@@ -2056,16 +2205,370 @@ impl Nesterov {
             }
         }
         self.nbs[b].is_converged = true;
-        true
+        Ok(true)
     }
 
     /// `NesterovPlace::isConverged`: every region asked, in order; converged when all are.
-    fn np_is_converged(&mut self, log: &mut Log, d: &Design, iter: i32) -> bool {
+    fn np_is_converged(&mut self, log: &mut Log, d: &Design, iter: i32, route: &mut Option<&mut Routability<'_>>, route_iters: i32) -> Res<bool> {
         let mut converged = 0;
         for b in 0..self.nbs.len() {
-            converged += usize::from(self.check_convergence(log, d, b, iter));
+            converged += usize::from(self.check_convergence(log, d, b, iter, route, route_iters)?);
         }
-        converged == self.nbs.len()
+        Ok(converged == self.nbs.len())
+    }
+
+    /// `isPlacementSettled`: every region's last step at most 0.6 of its largest — and some step
+    /// taken.
+    fn is_placement_settled(&self) -> bool {
+        self.nbs.iter().all(|nb| nb.peak_coordi_distance > 0.0 && nb.coordi_distance <= 0.6f32 * nb.peak_coordi_distance)
+    }
+
+    /// The density centre of every standard (non-macro) instance cell, region by region —
+    /// `markTilesWithMovableArea`'s points.
+    fn std_centres(&self) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        for nb in &self.nbs {
+            for &gi in &nb.cells {
+                let g = &self.gcells[gi];
+                if g.is_instance() && !g.macro_ {
+                    out.push((g.d_cx(), g.d_cy()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// `GCell::setSize`: the box resized about its own (integer) centre — halves truncated, so an odd
+/// size loses one. The density box is left to `updateDensitySize`.
+fn set_size(g: &mut GCell, dx: i32, dy: i32) {
+    let (cx, cy) = ((g.lx + g.ux) / 2, (g.ly + g.uy) / 2);
+    g.lx = cx - dx / 2;
+    g.ly = cy - dy / 2;
+    g.ux = cx + dx / 2;
+    g.uy = cy + dy / 2;
+}
+
+/// `percentDiff`: the relative change in percent, 0 from 0.
+fn percent_diff(old: f64, new: f64) -> f64 {
+    if old == 0.0 {
+        0.0
+    } else {
+        (new - old) / old * 100.0
+    }
+}
+
+impl Nesterov {
+    fn is_std_instance(&self, gi: usize) -> bool {
+        self.gcells[gi].is_instance() && !self.gcells[gi].macro_
+    }
+
+    /// `RouteBase`'s construction: one slot per region, the regions' instance area, and
+    /// `resizeMinRcCellSize` (every cell 0 × 0).
+    pub fn route_base_init(&mut self, rb: &mut RouteBase) {
+        let area = self.nbs.iter().map(nesterov_insts_area).sum();
+        rb.init(self.nbs.len(), area);
+        self.min_rc_cell_size = vec![(0, 0); self.gcells.len()];
+    }
+
+    /// `updateMinRcCellSize`: each standard instance cell's size now.
+    fn update_min_rc_cell_size(&mut self) {
+        for gi in 0..self.gcells.len() {
+            if self.is_std_instance(gi) {
+                self.min_rc_cell_size[gi] = (self.gcells[gi].dx(), self.gcells[gi].dy());
+            }
+        }
+    }
+
+    /// `NesterovBase::setTargetDensity`: the region's and every bin's, then the bins' fixed area
+    /// again (it is scaled by it).
+    fn set_target_density(&mut self, b: usize, density: f32) {
+        let nb = &mut self.nbs[b];
+        nb.target_density = density;
+        for bin in nb.bg.bins.iter_mut() {
+            bin.target_density = density;
+        }
+        update_bins_non_place_area(nb);
+    }
+
+    /// `updateAreas`: the region's standard and macro instance areas from its cells' sizes now.
+    fn update_areas(&mut self, b: usize) {
+        let (mut std, mut mac) = (0i64, 0i64);
+        for &gi in &self.nbs[b].cells {
+            let g = &self.gcells[gi];
+            if !g.is_instance() {
+                continue;
+            }
+            let a = i64::from(g.dx()) * i64::from(g.dy());
+            if g.macro_ {
+                mac += a;
+            } else {
+                std += a;
+            }
+        }
+        self.nbs[b].std_insts_area = std;
+        self.nbs[b].macro_insts_area = mac;
+    }
+
+    /// `cutFillerCells`: fillers taken out from the back of the region's cells — as many whole
+    /// fillers as the inflation covers — each with its state kept; the filler area left; and when
+    /// more than a filler's area is still to be absorbed, the target density raised to take it.
+    fn cut_filler_cells(&mut self, log: &mut Log, d: &Design, b: usize, inflation_area: i64) {
+        if inflation_area < 0 {
+            log.warn("GPL", 313, format!("Negative area provided to remove fillers: {}. Expected positive value, ignoring.", dbu_area(d, inflation_area as f64)));
+            return;
+        }
+        let single = i64::from(self.nbs[b].filler_dx) * i64::from(self.nbs[b].filler_dy);
+        let max_remove = (inflation_area / single).min(self.nbs[b].fillers as i64);
+        let (area_before, count_before) = (self.nbs[b].total_filler_area, self.nbs[b].fillers);
+        let mut available = single * self.nbs[b].fillers as i64;
+        let mut removed = 0i64;
+        let mut i = self.nbs[b].cells.len() as i64 - 1;
+        while i >= 0 && removed < max_remove {
+            let gi = self.nbs[b].cells[i as usize];
+            if !self.gcells[gi].is_instance() {
+                let f = self.nbs[b].swap_pop(i as usize);
+                let nb = &mut self.nbs[b];
+                nb.removed_fillers.push(f);
+                nb.fillers -= 1;
+                available -= single;
+                removed += 1;
+            }
+            i -= 1;
+        }
+        self.nbs[b].total_filler_area = available;
+        let nb = &self.nbs[b];
+        if single * nb.fillers as i64 != nb.total_filler_area {
+            log.warn("GPL", 312, format!("Unexpected filler area! The value {}, should be equal to totalFillerArea_ {}.", dbu_area(d, (single * nb.fillers as i64) as f64), dbu_area(d, nb.total_filler_area as f64)));
+        }
+        let count_pct = if count_before != 0 { (nb.fillers as i64 - count_before as i64) as f64 / count_before as f64 * 100.0 } else { 0.0 };
+        log.info("GPL", 76, format!("Removing fillers, count: Before: {}, After: {} ({:+.2}%)", count_before, nb.fillers, count_pct));
+        let area_pct = if area_before != 0 { (nb.total_filler_area - area_before) as f64 / area_before as f64 * 100.0 } else { 0.0 };
+        log.info("GPL", 77, format!("Filler area (um^2)     : Before: {:.3}, After: {:.3} ({:+.2}%)", dbu_area(d, area_before as f64), dbu_area(d, nb.total_filler_area as f64), area_pct));
+        let removed_area = single * removed;
+        let remaining = inflation_area - removed_area;
+        log.info("GPL", 78, format!("Removed fillers count: {}, area removed: {:.3} um^2. Remaining area to be compensated by modifying density: {:.3} um^2", removed, dbu_area(d, removed_area as f64), dbu_area(d, remaining as f64)));
+        if remaining > single {
+            let total = nesterov_insts_area(nb) + removed_area + nb.total_filler_area + remaining;
+            let density = total as f32 / nb.white_space_area as f32;
+            self.set_target_density(b, density);
+            let nb = &mut self.nbs[b];
+            nb.movable_area = (nb.white_space_area as f32 * nb.target_density) as i64;
+            log.info("GPL", 79, format!("New target density: {}", nb.target_density));
+        }
+    }
+
+    /// `restoreRemovedFillers`: every filler taken out since the last minimum put back at the
+    /// end, in the order it was taken (GPL-0080..0082).
+    fn restore_removed_fillers(&mut self, log: &mut Log, d: &Design, b: usize) {
+        let n = self.nbs[b].removed_fillers.len();
+        log.info("GPL", 80, format!("Restoring {n} previously removed fillers."));
+        if n == 0 {
+            return;
+        }
+        let nb = &mut self.nbs[b];
+        let (count_before, area_before) = (nb.fillers, nb.total_filler_area);
+        let single = i64::from(nb.filler_dx) * i64::from(nb.filler_dy);
+        let removed = std::mem::take(&mut nb.removed_fillers);
+        for f in &removed {
+            nb.push_back(f);
+            nb.fillers += 1;
+            nb.total_filler_area += single;
+        }
+        let count_pct = if count_before > 0 { (nb.fillers - count_before) as f64 / count_before as f64 * 100.0 } else { 0.0 };
+        let area_pct = if area_before > 0 { (nb.total_filler_area - area_before) as f64 / area_before as f64 * 100.0 } else { 0.0 };
+        log.info("GPL", 81, format!("Number of fillers before restoration {} and after {} . Relative change: {:+.2}%%", count_before, nb.fillers, count_pct));
+        log.info("GPL", 82, format!("Total filler area before restoration {:.2} and after {:.2} (um^2). Relative change: {:+.2}%%", dbu_area(d, area_before as f64), dbu_area(d, nb.total_filler_area as f64), area_pct));
+    }
+
+    /// `revertToMinCongestion`: every standard cell back to its size at the minimum congestion,
+    /// each region to that pass's target density with its removed fillers restored; the
+    /// accumulated inflation as it stood then (GPL-0055..0057).
+    fn revert_to_min_congestion(&mut self, log: &mut Log, d: &Design, rb: &mut RouteBase, common: &Common) {
+        log.info("GPL", 55, "Reverting inflation values and target density from the iteration with minimum observed routing congestion.");
+        log.info("GPL", 56, format!("Minimum observed routing congestion: {:.4}", rb.min_rc));
+        for gi in 0..self.gcells.len() {
+            if self.is_std_instance(gi) {
+                let (dx, dy) = self.min_rc_cell_size[gi];
+                set_size(&mut self.gcells[gi], dx, dy);
+            }
+        }
+        for b in 0..self.nbs.len() {
+            let group = self.nbs[b].group.as_ref().map(|g| format!(" ({g})")).unwrap_or_default();
+            log.info("GPL", 57, format!("Target density at minimum routing congestion: {:.4}{}", rb.min_rc_target_density[b], group));
+            self.set_target_density(b, rb.min_rc_target_density[b]);
+            self.restore_removed_fillers(log, d, b);
+            update_density_size(&mut self.gcells, &self.nbs[b]);
+            rb.accumulated[b] = rb.min_rc_inflated[b];
+        }
+        rb.net_weights = rb.min_rc_net_weights.clone();
+        self.apply_net_weights(common, rb);
+        rb.reset_resources();
+    }
+
+    /// `applyNetWeights`: each net's weight from the route base's map (at least 1), every other
+    /// net back to 1; how many are above 1.
+    fn apply_net_weights(&mut self, common: &Common, rb: &RouteBase) -> usize {
+        let mut weighted = 0;
+        for (n, g) in self.gnets.iter_mut().enumerate() {
+            let mut w = 1.0f32;
+            if let Some(&x) = rb.net_weights.get(&common.nets[n].0) {
+                w = w.max(x);
+            }
+            g.custom_weight = w;
+            if w > 1.0 {
+                weighted += 1;
+            }
+        }
+        weighted
+    }
+
+    /// `scaleInflationToBudget`: the area this pass would add (each inflated standard cell's area
+    /// times its tile's excess ratio) against its ration — a sixth of the budget, or what is left
+    /// of it; over the ration every tile's excess is scaled down (GPL-0099). Whether the budget is
+    /// spent.
+    fn scale_inflation_to_budget(&self, log: &mut Log, rb: &mut RouteBase) -> bool {
+        if rb.original_movable_area <= 0 {
+            return false;
+        }
+        let budget = rb.original_movable_area as f64 * f64::from(rb.vars.max_inflation_total);
+        let spent = rb.total_inflation() as f64;
+        let allowed = (budget / 6.0).min(budget - spent);
+        let mut wanted = 0.0f64;
+        for nb in &self.nbs {
+            for &gi in &nb.cells {
+                if !self.is_std_instance(gi) {
+                    continue;
+                }
+                let g = &self.gcells[gi];
+                let Some(ratio) = rb.inflated_ratio_at(g.d_cx(), g.d_cy()) else { continue };
+                if f64::from(ratio) <= 1.0 {
+                    continue;
+                }
+                let area = f64::from(g.dx()) * f64::from(g.dy());
+                wanted += area * (f64::from(ratio) - 1.0);
+            }
+        }
+        if wanted <= 0.0 || wanted <= allowed {
+            return spent + wanted >= budget;
+        }
+        let scale = 0.0f64.max(allowed / wanted);
+        rb.scale_inflated(scale);
+        log.info("GPL", 99, format!("Routability inflation trimmed to {:.2}% of what this iteration asked for; {:.2}% of the {:.2}% budget still unspent.", 100.0 * scale, 100.0 * (budget - spent - allowed) / rb.original_movable_area as f64, 100.0 * f64::from(rb.vars.max_inflation_total)));
+        spent + allowed >= budget
+    }
+
+    /// `RouteBase::routability`: congestion measured; below the target routability ends. Else
+    /// the minimum kept (GPL-0048) or a non-improvement counted (GPL-0049); the tiles' inflated
+    /// ratios set and trimmed to the budget; each region's standard cells in inflated tiles grown
+    /// by the root of the ratio (GPL-0086, 0052), fillers cut for the area; then the exits — the
+    /// target density over its maximum (GPL-0053), too many passes (GPL-0091), no improvement for
+    /// three (GPL-0054), each reverting to the minimum — else the areas and density sizes renewed
+    /// (GPL-0058..0063) and, with the budget spent (GPL-0097), the revert. Returns
+    /// `(is_routability_need, is_revert_init_needed)`.
+    fn routability(&mut self, log: &mut Log, d: &Design, r: &mut Routability<'_>, revert_count: i32) -> Res<(bool, bool)> {
+        let (locations, centres) = (placed_locations(r.common, self), self.std_centres());
+        let cur_rc = r.rb.measure(log, &mut *r.router, &locations, &centres)?;
+        let v = r.rb.vars;
+        if cur_rc < v.target_rc {
+            log.info("GPL", 50, format!("Weighted routing congestion is lower than target routing congestion({:.4}), end routability optimization.", v.target_rc));
+            r.rb.reset_resources();
+            return Ok((false, false));
+        }
+        if (r.rb.min_rc - cur_rc) > r.rb.min_rc * 0.005f32 {
+            log.info("GPL", 48, format!("Routing congestion ({:.4}) lower than previous minimum ({}). Updating minimum.", cur_rc, fmt_g_prec(f64::from(r.rb.min_rc), 4)));
+            r.rb.min_rc = cur_rc;
+            r.rb.min_rc_violated = 0;
+            for b in 0..self.nbs.len() {
+                r.rb.min_rc_target_density[b] = self.nbs[b].target_density;
+                self.nbs[b].removed_fillers.clear();
+            }
+            self.update_min_rc_cell_size();
+            r.rb.min_rc_inflated = r.rb.accumulated.clone();
+            r.rb.min_rc_net_weights = r.rb.net_weights.clone();
+        } else {
+            r.rb.min_rc_violated += 1;
+            log.info("GPL", 49, format!("Routing congestion ({:.4}) higher than minimum ({:.4}). Consecutive non-improvement count: {}.", cur_rc, r.rb.min_rc, r.rb.min_rc_violated));
+        }
+        r.rb.set_inflated_ratios();
+        let budget_spent = self.scale_inflation_to_budget(log, &mut r.rb);
+        let n = self.nbs.len();
+        let (mut prev_white, mut prev_movable, mut prev_filler, mut prev_total, mut prev_expected) = (vec![0f64; n], vec![0f64; n], vec![0f64; n], vec![0f64; n], vec![0f64; n]);
+        for b in 0..n {
+            r.rb.inflated_delta[b] = 0;
+            for k in 0..self.nbs[b].cells.len() {
+                let gi = self.nbs[b].cells[k];
+                if !self.is_std_instance(gi) {
+                    continue;
+                }
+                let g = &self.gcells[gi];
+                let Some(ratio) = r.rb.inflated_ratio_at(g.d_cx(), g.d_cy()) else { continue };
+                if f64::from(ratio) <= 1.0 {
+                    continue;
+                }
+                let prev = i64::from(g.dx()) * i64::from(g.dy());
+                let root = ratio.sqrt();
+                let (nx, ny) = ((g.dx() as f32 * root).round() as i32, (g.dy() as f32 * root).round() as i32);
+                set_size(&mut self.gcells[gi], nx, ny);
+                let g = &self.gcells[gi];
+                r.rb.inflated_delta[b] += i64::from(g.dx()) * i64::from(g.dy()) - prev;
+            }
+            r.rb.accumulated[b] += r.rb.inflated_delta[b];
+            let delta = r.rb.inflated_delta[b];
+            let nb = &self.nbs[b];
+            let pct = (delta as f32 / nesterov_insts_area(nb) as f32) * 100.0f32;
+            log.info("GPL", 86, format!("Inflated area:              {:10.3} um^2 ({:+.2}%)", dbu_area(d, delta as f64) as f32, pct));
+            log.info("GPL", 52, format!("Placement target density:   {:10.4}", nb.target_density));
+            prev_white[b] = nb.white_space_area as f64;
+            prev_movable[b] = nb.movable_area as f64;
+            prev_filler[b] = nb.total_filler_area as f64;
+            prev_total[b] = (nesterov_insts_area(nb) + nb.total_filler_area) as f64;
+            prev_expected[b] = delta as f64 + prev_total[b];
+            self.cut_filler_cells(log, d, b, delta);
+            if self.nbs[b].target_density > v.max_density {
+                let nb = &self.nbs[b];
+                let group = nb.group.as_ref().map(|g| format!(" in group {g}")).unwrap_or_default();
+                log.info("GPL", 53, format!("Target density {:.4} exceeds the maximum allowed {:.4}{}.", nb.target_density, v.max_density, group));
+                self.revert_to_min_congestion(log, d, &mut r.rb, r.common);
+                return Ok((false, true));
+            }
+        }
+        if revert_count >= 50 {
+            log.info("GPL", 91, format!("Routability mode reached the maximum allowed reverts {revert_count}"));
+            self.revert_to_min_congestion(log, d, &mut r.rb, r.common);
+            return Ok((false, true));
+        }
+        if r.rb.min_rc_violated >= 3 {
+            log.info("GPL", 54, format!("No improvement in routing congestion for {} consecutive iterations (limit is {}).", r.rb.min_rc_violated, 3));
+            self.revert_to_min_congestion(log, d, &mut r.rb, r.common);
+            return Ok((false, true));
+        }
+        for b in 0..n {
+            self.update_areas(b);
+            let nb = &self.nbs[b];
+            let new_total = (nesterov_insts_area(nb) + nb.total_filler_area) as f64;
+            let new_expected = r.rb.inflated_delta[b] as f64 + new_total;
+            log.info("GPL", 58, format!("White space area:           {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.white_space_area as f64), percent_diff(prev_white[b], nb.white_space_area as f64)));
+            log.info("GPL", 59, format!("Movable instances area:     {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.movable_area as f64), percent_diff(prev_movable[b], nb.movable_area as f64)));
+            log.info("GPL", 60, format!("Total filler area:          {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.total_filler_area as f64), percent_diff(prev_filler[b], nb.total_filler_area as f64)));
+            log.info("GPL", 61, format!("Total non-inflated area:    {:10.3} um^2 ({:+.2}%)", dbu_area(d, new_total), percent_diff(prev_total[b], new_total)));
+            log.info("GPL", 62, format!("Total inflated area:        {:10.3} um^2 ({:+.2}%)", dbu_area(d, new_expected), percent_diff(prev_expected[b], new_expected)));
+            log.info("GPL", 63, format!("New Target Density:         {:10.4}", nb.target_density));
+            update_density_size(&mut self.gcells, &self.nbs[b]);
+        }
+        // `weightCongestedNets`
+        if let Some(depositors) = r.rb.weight_congested_nets(&mut *r.router)? {
+            let weighted = self.apply_net_weights(r.common, &r.rb);
+            log.info("GPL", 93, format!("Weighted {weighted} of {depositors} nets feeding congested tiles, up to {:.2}x wirelength weight.", r.rb.vars.net_weight_max));
+        } else {
+            self.apply_net_weights(r.common, &r.rb);
+        }
+        r.rb.reset_resources();
+        if budget_spent {
+            log.info("GPL", 97, format!("Total routability inflation {:.2}% of the movable area spent the {:.2}% budget, ending routability.", 100.0 * r.rb.total_inflation() as f64 / r.rb.original_movable_area as f64, 100.0 * f64::from(r.rb.vars.max_inflation_total)));
+            self.revert_to_min_congestion(log, d, &mut r.rb, r.common);
+        }
+        Ok((!budget_spent, true))
     }
 }
 
@@ -2088,12 +2591,12 @@ pub fn placed_locations(c: &Common, nb: &Nesterov) -> Vec<(usize, i32, i32)> {
 /// `Replace::doNesterovPlace` from GPL-0084 (the placer is built): the reference HPWL, the
 /// placer's init, then the loop — `NesterovPlace::doNesterovPlace` — and its report. Returns the
 /// final iteration.
-pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i32> {
+pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, route: Option<&mut Routability<'_>>) -> Res<i32> {
     // `NesterovPlaceVars`: the reference HPWL, from the design's own (initial) HPWL when unset.
     let design_hpwl = np.hpwl();
     np.reference_hpwl = if np.o.reference_hpwl > 0.0 { np.o.reference_hpwl } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) };
     np.np_init(log)?;
-    resume_nesterov_place(log, d, np, 0)
+    resume_nesterov_place(log, d, np, 0, route)
 }
 
 /// `Replace::doNesterovPlace` again on the placer that already exists (`initNesterovPlace` finds
@@ -2102,7 +2605,7 @@ pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i3
 pub fn continue_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, overflow: f32, max_iter: i32, start_iter: i32) -> Res<i32> {
     np.o.overflow = overflow;
     np.max_iter = max_iter;
-    resume_nesterov_place(log, d, np, start_iter)
+    resume_nesterov_place(log, d, np, start_iter, None)
 }
 
 /// `PlacerBase::unlockAll` for every region: no cell (and no instance) locked.
@@ -2115,8 +2618,16 @@ pub fn unlock_all(np: &mut Nesterov, c: &mut Common) {
     }
 }
 
+/// Routability-driven placement's state across the loop: the route base, the router it measures
+/// with, and the placer's instances (where each one is written).
+pub struct Routability<'a> {
+    pub rb: RouteBase,
+    pub router: &'a mut dyn Router,
+    pub common: &'a Common,
+}
+
 /// `NesterovPlace::doNesterovPlace(start_iter)` with GPL-0084 before it.
-fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_iter: i32) -> Res<i32> {
+fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_iter: i32, mut route: Option<&mut Routability<'_>>) -> Res<i32> {
     log.info("GPL", 84, "---- Execute Nesterov Global Placement.");
     if np.num_region_diverged > 0 {
         let (code, msg) = np.diverge.unwrap_or((0, ""));
@@ -2131,6 +2642,9 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         original_area += nesterov_insts_area(nb);
     }
     let (mut saved, mut snap) = (false, (0f32, 0f32));
+    // the routability snapshot: saved, its WA coefficients and step parameter
+    let (mut route_saved, mut route_snap, mut route_snap_a) = (false, (0f32, 0f32), 0f32);
+    let (mut route_iters, mut route_reverts) = (0i32, 0i32);
     let mut cur_a = 1.0f32;
     let mut iter = start_iter;
     while iter < np.max_iter {
@@ -2148,10 +2662,59 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         for b in 0..np.nbs.len() {
             np.probe(log, b, "IT", iter, np.wl_coef_x, cur_a);
         }
+        let routability = np.o.routability.is_some();
+        // `is_routability_gpl_iter`: each such iteration extends the limit by one
+        if route_saved && np.average_overflow_unscaled > np.o.routability_end_overflow {
+            route_iters += 1;
+            np.max_iter += 1;
+        }
         if np.np_is_diverged(log, &mut saved, &mut snap) {
             break;
         }
-        if np.np_is_converged(log, d, iter) {
+        // `routabilitySnapshot`
+        if routability && !route_saved && np.o.routability_snapshot_overflow >= np.average_overflow_unscaled {
+            route_snap = (np.wl_coef_x, np.wl_coef_y);
+            route_snap_a = cur_a;
+            route_saved = true;
+            for b in 0..np.nbs.len() {
+                np.save_snapshot(b);
+            }
+            log.info("GPL", 38, format!("Routability snapshot saved at iter = {}", iter + 1));
+            let hpwl = np.hpwl();
+            log.report(format!("{iter:9} | {:8.4} | {} | {:8} | {:9} | {:>5}", np.average_overflow_unscaled, fmt_e(hpwl as f64 / f64::from(d.dbu), 6, 13), " ", " ", " "));
+        }
+        // `runRoutability`
+        if let Some(r) = route.as_mut() {
+            if np.routability_need && np.average_overflow_unscaled <= np.o.routability_end_overflow && np.is_placement_settled() {
+                np.nbs[0].reprint_header = true;
+                route_reverts += 1;
+                let (need, revert_init) = np.routability(log, d, r, route_reverts)?;
+                np.routability_need = need;
+                np.min_hpwl = i64::MAX;
+                np.is_min_hpwl = false;
+                if need || revert_init {
+                    cur_a = route_snap_a;
+                    np.wl_coef_x = route_snap.0;
+                    np.wl_coef_y = route_snap.1;
+                    np.update_wirelength_force_wa();
+                    for b in 0..np.nbs.len() {
+                        np.revert_to_snapshot(b);
+                        np.nbs[b].min_sum_overflow = 1e30;
+                        np.nbs[b].hpwl_with_min_sum_overflow = 1e30;
+                    }
+                }
+                if need && revert_init {
+                    log.info("GPL", 87, "Routability end iteration: increase inflation and revert back to snapshot.");
+                }
+                if !need && revert_init {
+                    log.info("GPL", 89, "Routability finished. Reverting to minimal observed routing congestion, could not reach target.");
+                }
+                if !need && !revert_init {
+                    log.info("GPL", 90, "Routability finished. Target routing congestion achieved succesfully.");
+                }
+            }
+        }
+        if np.np_is_converged(log, d, iter, &mut route, route_iters)? {
             break;
         }
         iter += 1;
@@ -2159,6 +2722,12 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
     // `reportResults`.
     if iter >= np.max_iter {
         log.warn("GPL", 1010, format!("GPL reached the maximum number of iterations for nesterov {}. Placement may have failed to converge.", np.max_iter));
+    }
+    if let Some(r) = route.as_ref() {
+        log.info("GPL", 1011, format!("Original area (um^2): {:.2}", dbu_area(d, original_area as f64)));
+        let inflation = r.rb.total_inflation();
+        let pct = (100.0 * inflation as f64 / original_area as f64) as f32;
+        log.info("GPL", 1012, format!("Total routability artificial inflation: {:.2} ({:+.2}%)", dbu_area(d, inflation as f64), pct));
     }
     let new_area: i64 = np.nbs.iter().map(nesterov_insts_area).sum();
     let diff = (100.0 * (new_area - original_area) as f64 / original_area as f64) as f32;
@@ -2187,6 +2756,24 @@ mod tests {
         // area 3: height sqrt(1.5) = 1.2247, width 2.4495 about (0, 0): each end truncated toward 0
         let c = Common { insts: vec![inst(-1, -1, 2, 0)], ..c };
         assert_eq!(cluster_box(&c, &[0], &d), (-1, 0, 1, 0));
+    }
+
+    /// Rule (`GCell::setSize`): the box is rebuilt about its integer centre from halves, so an
+    /// odd size loses one — an inflated 7-wide cell is 6 wide.
+    #[test]
+    fn set_size_rebuilds_from_halves() {
+        let mut g = GCell { lx: 0, ly: 0, ux: 10, uy: 4, ..GCell::default() };
+        set_size(&mut g, 7, 5);
+        assert_eq!((g.lx, g.ly, g.ux, g.uy), (2, 0, 8, 4));
+    }
+
+    /// Rule (`%.4g`): the exponent comes from the rounded `%e` form; 1e30 prints as `1e+30`.
+    #[test]
+    fn g_format_with_precision() {
+        assert_eq!(fmt_g_prec(1e30, 4), "1e+30");
+        assert_eq!(fmt_g_prec(0.29794, 4), "0.2979");
+        assert_eq!(fmt_g_prec(9999.6, 4), "1e+04");
+        assert_eq!(fmt_g_prec(0.00012345, 4), "0.0001234");
     }
 
     /// Rule (`fastExp`): `(1 + x/1024)` squared ten times, in float — not `exp`.

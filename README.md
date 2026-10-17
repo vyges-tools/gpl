@@ -48,10 +48,16 @@ and a `status`:
   region its own density field;
 - incremental placement: the instances already placed held where they are while the new ones
   settle, then everything released for a second pass;
-- placement clusters: a group of instances moved as one cell, sized to their total area.
+- placement clusters: a group of instances moved as one cell, sized to their total area;
+- routability-driven placement: the routability snapshot, then congestion measured on the global
+  router's grid — by RUDY (each net's wire density spread over the tiles its box covers) or by
+  the global router's own usage (`-routability_use_grt`); over the target, the cells in
+  congested tiles inflated within the inflation budget, fillers removed for the area, the
+  nets feeding those tiles reweighted, and the placement re-run from the snapshot — until the
+  congestion meets the target, stops improving or the budget is spent, when the best pass is
+  restored.
 
-Refused rather than guessed: `-timing_driven`, `-routability_driven`, `-virtual_cts`,
-`-place_ios`.
+Refused rather than guessed: `-timing_driven`, `-virtual_cts`, `-place_ios`.
 
 ## Build
 
