@@ -48,6 +48,22 @@ jobs:
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/grt
+          path: vyges-tools-grt
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/est
+          path: vyges-tools-est
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/sta
+          path: vyges-tools-sta
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/stt
+          path: vyges-tools-stt
       # The [patch] paths must resolve even when the features that use them are off.
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -83,6 +99,22 @@ jobs:
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/grt
+          path: vyges-tools-grt
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/est
+          path: vyges-tools-est
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/sta
+          path: vyges-tools-sta
+      - uses: actions/checkout@v7
+        with:
+          repository: vyges-tools/stt
+          path: vyges-tools-stt
 
       - name: Toolchain
         # Boost (headers) + zlib only; fmt/spdlog/abseil are built from source by libodb's build.
