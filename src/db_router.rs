@@ -20,14 +20,29 @@ struct Edges {
     v3: Vec<EdgeState>,
 }
 
+/// Reads the placer's design from a database (the resizer's edits, re-read).
+pub type ReadDesign<'a> = dyn Fn(&Db) -> Res<crate::placer_base::Design> + 'a;
+
 pub struct DbRouter<'a> {
     pub db: &'a mut Db,
     edges: Option<Edges>,
+    /// The resizer's session (timing-driven placement): the job's libraries, corners, RC,
+    /// dont_use and constraints, as resizer steps.
+    pub rsz_steps: Vec<serde_json::Value>,
+    rsz_calls: usize,
+    /// The resizer's timer levels as its last call left them: the reference's one timer persists
+    /// across the reweights, its incremental levels with it.
+    sta_levels: Option<serde_json::Value>,
+    /// A diagnostic: where each resizer call writes its debug trace (`<path>.<call>`, from 1),
+    /// at the levels the job's `set_debug_level RSZ ...` steps set.
+    pub rsz_trace: Option<String>,
+    /// The design re-read after the resizer edits it.
+    pub read_design: Option<&'a ReadDesign<'a>>,
 }
 
 impl<'a> DbRouter<'a> {
     pub fn new(db: &'a mut Db) -> DbRouter<'a> {
-        DbRouter { db, edges: None }
+        DbRouter { db, edges: None, rsz_steps: Vec::new(), rsz_trace: None, rsz_calls: 0, sta_levels: None, read_design: None }
     }
 }
 
@@ -80,6 +95,89 @@ impl Router for DbRouter<'_> {
         let dbu = f64::from(self.db.tech_get_db_units_per_micron());
         log.info("GPL", 1018, format!("Final HPWL (um): {:.2}", hpwl as f64 / dbu));
         Ok(())
+    }
+
+    /// `Resizer::findResizeSlacks` on this database: the instances written, then the resizer's
+    /// session steps, `estimate_parasitics -placement`, `repair_design` at the preamble's wire
+    /// length, `fully_rebuffer`, and the driver slacks — its lines (repair_design's table, the
+    /// rebuffering's), the slacks in block order, the design re-read.
+    fn resize_slack_preamble(&mut self, log: &mut Log) -> Res<()> {
+        use serde_json::{json, Value};
+        let mut steps = self.rsz_steps.clone();
+        steps.push(json!({ "cmd": "resize_slack_preamble", "args": [] }));
+        let db = std::mem::replace(&mut *self.db, Db::new());
+        let (report, db) = vyges_rsz::job::run_owned(&json!({ "steps": steps }), db).map_err(|e| crate::log::Stop::Refused(format!("the resizer: {e}")))?;
+        *self.db = db;
+        let p = &report["resize_slack_preamble"];
+        if p.is_null() {
+            return refuse(format!("the resizer: {}", report["reason"].as_str().unwrap_or("no slack preamble")));
+        }
+        // a code `RSZ-NNNN` as the logger's (tool, id)
+        let id = |v: &Value| v["code"].as_str().and_then(|c| c.strip_prefix("RSZ-")).and_then(|n| n.parse::<u32>().ok());
+        for w in p["warnings"].as_array().into_iter().flatten() {
+            let Some(n) = id(w) else { return refuse(format!("the resizer: warning {w}")) };
+            log.warn("RSZ", n, w["message"].as_str().unwrap_or_default());
+        }
+        if !p["error"].is_null() {
+            let Some(n) = id(&p["error"]) else { return refuse(format!("the resizer: error {}", p["error"])) };
+            return log.error("RSZ", n, p["error"]["message"].as_str().unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    fn find_resize_slacks(&mut self, log: &mut Log, locations: &[(usize, i32, i32)], repair_timing: bool, _tns_end_percent: f32) -> Res<crate::timing_driven::ResizeReport> {
+        use serde_json::{json, Value};
+        if repair_timing {
+            return refuse("-timing_driven_repair_timing (one setup repair pass at the last reweight) is not modelled");
+        }
+        let Some(read_design) = self.read_design else { return refuse("timing-driven placement without the design reader") };
+        self.write_locations(log, locations)?;
+        let mut steps = self.rsz_steps.clone();
+        steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-placement"] }));
+        steps.push(json!({ "cmd": "repair_design", "args": ["-vyges_resize_slack"] }));
+        // the slacks on the timer the rebuffering left (`findResizeSlacks1` after `fullyRebuffer`)
+        steps.push(json!({ "cmd": "fully_rebuffer", "args": ["NULL", "-vyges_resize_slacks"] }));
+        let mut job = json!({ "steps": steps });
+        if let Some(l) = &self.sta_levels {
+            job["sta_levels"] = l.clone();
+        }
+        self.rsz_calls += 1;
+        if let Some(p) = &self.rsz_trace {
+            job["timing_trace"] = json!(format!("{p}.{}", self.rsz_calls));
+        }
+        // `db_cbk_->addOwner(block)` before the reweight: the placer's own callbacks
+        self.db.observer_log_start().map_err(e)?;
+        let net_ids_before = self.db.net_ids();
+        let db = std::mem::replace(&mut *self.db, Db::new());
+        let (report, db) = vyges_rsz::job::run_owned(&job, db).map_err(|e| crate::log::Stop::Refused(format!("the resizer: {e}")))?;
+        *self.db = db;
+        if matches!(report["status"].as_str(), Some("refused") | Some("error")) {
+            return refuse(format!("the resizer: {}", report["reason"].as_str().unwrap_or("refused")));
+        }
+        let mut lines: Vec<String> = report["repair_design_progress"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let runs = report["repair_timing"].as_array().cloned().unwrap_or_default();
+        let mut slacks = Vec::new();
+        for r in &runs {
+            if let Some(l) = r["lines"].as_array() {
+                lines.extend(l.iter().filter_map(Value::as_str).map(String::from));
+            }
+            if let Some(s) = r["resize_slacks"].as_array() {
+                for x in s {
+                    slacks.push((x["net"].as_str().unwrap_or_default().to_string(), x["slack"].as_f64().unwrap_or(f64::from(f32::MAX)) as f32));
+                }
+            }
+        }
+        if runs.len() < 2 {
+            return refuse(format!("the resizer stopped: {}", report["timing_stop"].as_str().unwrap_or("before its slacks")));
+        }
+        let events = self.db.observer_log_take();
+        self.sta_levels = report.get("sta_levels").cloned();
+        let net_ids_after = self.db.net_ids();
+        let design = read_design(self.db)?;
+        if design.nets.len() != net_ids_after.len() {
+            return refuse("the design's nets are not the block's: net ids unaligned");
+        }
+        Ok(crate::timing_driven::ResizeReport { lines, events, net_ids_before, net_ids_after, slacks, design })
     }
 
     /// `Rudy::Rudy` on an uninitialized router: `getMinMaxLayer`, `initFastRoute(min, max, false)`

@@ -222,6 +222,9 @@ fn run(job: &Value) -> Result<Value, String> {
     let mut db: Option<Db> = None;
     let mut threads = vyges_gpl::run::Threads { asked: 1, cores: physical_core_count() };
     let mut clusters: Vec<Vec<usize>> = Vec::new();
+    // The resizer's session as the job sets it up (timing-driven placement replays it at each
+    // reweight): its libraries, corners, RC, dont_use and constraints.
+    let mut rsz_steps: Vec<Value> = Vec::new();
     let mut log = Log::default();
     let finish = |log: Log, stop: Option<String>, extra: Value| {
         let (status, reason) = match stop {
@@ -249,6 +252,10 @@ fn run(job: &Value) -> Result<Value, String> {
                 "set_debug_level" => {
                     let [tool, group, level] = args.as_slice() else { return refuse("set_debug_level: needs a tool, a group and a level") };
                     let level: i32 = level.parse().map_err(|_| Stop::Refused(format!("set_debug_level {level}: not an integer")))?;
+                    // the resizer's groups are its own: they trace its reweights (`rsz_trace`)
+                    if tool == "RSZ" {
+                        rsz_steps.push(step.clone());
+                    }
                     log.debug.insert((tool.clone(), group.clone()), level);
                 }
                 // `placement_cluster`: its names (one list, or several), each found as `get_cells`
@@ -274,6 +281,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     log.info("GPL", 96, format!("Created placement cluster of {} instances.", members.len()));
                     clusters.push(members);
                 }
+                "read_liberty" | "define_corners" | "set_wire_rc" | "set_layer_rc" | "set_dont_use" | "read_sdc" | "set_routing_alpha" => {
+                    rsz_steps.push(step.clone());
+                }
                 "set_thread_count" => {
                     let [n] = args.as_slice() else { return refuse("set_thread_count: needs one count") };
                     threads.asked = n.parse().map_err(|_| Stop::Refused(format!("set_thread_count {n}: not a count")))?;
@@ -286,6 +296,14 @@ fn run(job: &Value) -> Result<Value, String> {
                     // The database the run writes mid-command: incremental placement's first pass
                     // (and its HPWL), routability's congestion passes.
                     let mut router = vyges_gpl::db_router::DbRouter::new(db.as_mut().expect("read before global_placement"));
+                    router.rsz_steps = rsz_steps.clone();
+                    router.rsz_trace = job["rsz_trace"].as_str().map(String::from);
+                    let reader = |db: &Db| -> Res<Design> {
+                        let mut d = design(db)?;
+                        d.clusters = clusters.clone();
+                        Ok(d)
+                    };
+                    router.read_design = Some(&reader);
                     return vyges_gpl::run::global_placement(&mut log, &d, &args, threads, Some(&mut router)).map(Some);
                 }
                 other => return refuse(format!("{other}: not a modelled step")),
@@ -325,6 +343,16 @@ fn run(job: &Value) -> Result<Value, String> {
                 let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins, "nesterov_iterations": iter,
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 // `updateDbGCells`: each placed instance at its location, PLACED.
+                let db = db.as_mut().expect("read before global_placement");
+                update_db_and_report_hpwl(db, &mut log, &locations, &io)?;
+                if let Some(path) = job["write_def"].as_str() {
+                    db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
+                }
+                return Ok(finish(log, None, extra));
+            }
+            Ok(Some(Outcome::PlacedEdited(c, bases, locations, iter, io, _design))) => {
+                let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins, "nesterov_iterations": iter,
+                    "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 let db = db.as_mut().expect("read before global_placement");
                 update_db_and_report_hpwl(db, &mut log, &locations, &io)?;
                 if let Some(path) = job["write_def"].as_str() {

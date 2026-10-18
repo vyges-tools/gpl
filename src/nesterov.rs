@@ -27,6 +27,7 @@ use crate::ooura;
 use crate::placer_base::{Base, Common, Design};
 use crate::initial_place::Ip;
 use crate::io_pins::{self, Die, Seg};
+use std::collections::HashMap;
 use crate::route_base::{RouteBase, RouteVars, Router};
 
 /// `PlaceOptions` as the plain Nesterov mode reads them.
@@ -206,12 +207,14 @@ pub struct GNet {
     y_max_y: f32,
     /// `customWeight_`: 1 unless routability reweights the net.
     custom_weight: f32,
+    /// `timingWeight_`: 1 unless timing-driven placement reweights the net.
+    timing_weight: f32,
 }
 
 impl GNet {
     /// `GNet::getTotalWeight`: timing (1, no timing-driven mode) × custom.
     fn total_weight(&self) -> f32 {
-        1.0f32 * self.custom_weight
+        self.timing_weight * self.custom_weight
     }
     fn hpwl(&self) -> i64 {
         if self.ux < self.lx {
@@ -562,6 +565,36 @@ impl Nb {
         RemovedFiller { cell, vals, snapshot }
     }
 
+    /// `NesterovBase::createCbkGCell`: the cell appended, every per-cell vector with it (the
+    /// snapshot vectors only when they are as long as the others).
+    fn append_cell(&mut self, gi: usize) {
+        let grow_snapshot = self.snapshot.len() == self.cur_slp.len();
+        self.cells.push(gi);
+        for v in self.per_cell() {
+            v.push(FloatPoint::default());
+        }
+        if grow_snapshot {
+            for v in self.snapshots() {
+                v.push(FloatPoint::default());
+            }
+        }
+    }
+
+    /// `NesterovBase::destroyCbkGCell`: the cell at `i` swapped with the last and popped, with
+    /// every per-cell vector (`swapAndPopParallelVectors`: the snapshot vectors only when they are
+    /// as long as the others).
+    fn destroy_cell(&mut self, i: usize) {
+        if self.cur_slp.len() == self.snapshot.len() {
+            for v in self.snapshots() {
+                v.swap_remove(i);
+            }
+        }
+        for v in self.per_cell() {
+            v.swap_remove(i);
+        }
+        self.cells.swap_remove(i);
+    }
+
     /// `restoreRemovedFillers`' per filler: appended, with its values (`appendParallelVectors`
     /// grows the snapshot vectors only when they are as long as the others).
     fn push_back(&mut self, f: &RemovedFiller) {
@@ -686,6 +719,16 @@ pub struct Nesterov {
     min_rc_cell_size: Vec<(i32, i32)>,
     /// `-place_ios`: each port's pin (`dbToNb(bterm)`), by port name.
     port_gpin: std::collections::HashMap<String, usize>,
+    /// Each pin's identity — an instance's terminal (instance name, terminal order) or a port —
+    /// what a netlist edit's re-read finds it by (`fixPointers`).
+    pin_keys: Vec<PinKey>,
+}
+
+/// A pin's identity across netlist edits.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PinKey {
+    Inst(String, usize),
+    Port(String),
 }
 
 /// A float point vector's FNV-1a (x then y, each little-endian) — the reference probe's.
@@ -773,7 +816,7 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
             }
         }
     }
-    let gnets: Vec<GNet> = ip.net_pins.iter().map(|p| GNet { pins: p.clone(), custom_weight: 1.0, ..GNet::default() }).collect();
+    let gnets: Vec<GNet> = ip.net_pins.iter().map(|p| GNet { pins: p.clone(), custom_weight: 1.0, timing_weight: 1.0, ..GNet::default() }).collect();
     let mut pin_net = vec![0usize; ip.pins.len()];
     for (n, pins) in ip.net_pins.iter().enumerate() {
         for &p in pins {
@@ -810,7 +853,20 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         routability_need: true,
         min_rc_cell_size: vec![],
         port_gpin: std::collections::HashMap::new(),
+        pin_keys: Vec::new(),
     };
+    // the pins in `PlacerBaseCommon`'s order: each net's terminals, then its ports
+    for (n, &(k, _)) in c.nets.iter().enumerate() {
+        let net = &d.nets[k];
+        for t in &net.iterms {
+            np.pin_keys.push(PinKey::Inst(d.insts[t.inst].name.clone(), t.order));
+        }
+        if ip.net_pins[n].len() == net.iterms.len() + net.bterms.len() {
+            for b in &net.bterms {
+                np.pin_keys.push(PinKey::Port(b.name.clone()));
+            }
+        }
+    }
     if o.place_ios {
         // each net's port pins follow its terminals in the net's order
         for (n, &(k, _)) in c.nets.iter().enumerate() {
@@ -2643,6 +2699,450 @@ impl Nesterov {
     }
 }
 
+/// Timing-driven placement across the loop: `TimingBase`'s state, the router (the database's
+/// resizer), the placer's instances it extends, and the design as it stands.
+pub struct TimingDriven<'a> {
+    pub state: crate::timing_driven::TdState,
+    pub router: &'a mut dyn Router,
+    pub common: &'a mut Common,
+    pub design: Design,
+    pub pad_right: i32,
+}
+
+/// What a netlist edit added: each new instance cell and the region it joins; the cells created
+/// and deleted; the area they added (`delta_area_`).
+struct Absorbed {
+    new_cells: Vec<(usize, usize)>,
+    created: i32,
+    deleted: i32,
+    delta_area: i64,
+}
+
+impl Nesterov {
+    /// The resizer's edits taken in, as the database callbacks and `fixPointers` take them: the
+    /// callbacks in the order the database raised them (`events`, the observer log) — an
+    /// instance created a cell (`createCbkGCell`: the placer instance, padded, at its database box
+    /// — `moveGCell`), appended to its region; an instance destroyed swap-popped from each region
+    /// and from the common cells (`destroyCbkGCell`); a net created or destroyed likewise — then
+    /// the new pins, then every cell's pins (its terminals in order), every pin's cell and net,
+    /// and every net's pins (its terminals, then its ports) again from the design. An instance
+    /// resized, or created and destroyed in the one call, is refused.
+    fn absorb_netlist(&mut self, old: &Design, new: &Design, report: &crate::timing_driven::ResizeReport, c: &mut Common, pad_right: i32) -> Res<Absorbed> {
+        let events = &report.events;
+        let new_ix: HashMap<&str, usize> = new.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
+        let old_names: std::collections::HashSet<&str> = old.insts.iter().map(|x| x.name.as_str()).collect();
+        let destroyed: std::collections::HashSet<&str> = events.iter().filter_map(|e| e.strip_prefix("inst_destroy|")).collect();
+        // each instance cell by its instance's name (`db_inst_to_nbc_index_map_`)
+        let mut cell_of: HashMap<String, usize> = HashMap::new();
+        for (gi, g) in self.gcells.iter().enumerate() {
+            let Some(k) = g.inst else { continue };
+            let Some(db) = c.insts[k].db else { continue };
+            let name = &old.insts[db].name;
+            if !g.members.is_empty() && g.members.iter().any(|&m| c.insts[m].db.is_some_and(|d| destroyed.contains(old.insts[d].name.as_str()))) {
+                return refuse(format!("{name}: a cluster member the resizer removed is not modelled"));
+            }
+            cell_of.insert(name.clone(), gi);
+        }
+        // each surviving instance on its index in the new design (a destroyed one loses it below)
+        for i in c.insts.iter_mut() {
+            let Some(k) = i.db else { continue };
+            let o = &old.insts[k];
+            match new_ix.get(o.name.as_str()) {
+                None if destroyed.contains(o.name.as_str()) => {}
+                None => return refuse(format!("{}: an instance the resizer removed without a callback is not modelled", o.name)),
+                Some(&n) if new.insts[n].master != o.master => return refuse(format!("{}: an instance the resizer resized is not modelled", o.name)),
+                Some(&n) => i.db = Some(n),
+            }
+        }
+        let mut out = Absorbed { new_cells: Vec::new(), created: 0, deleted: 0, delta_area: 0 };
+        let pad_left = self.o.pad_left;
+        // the gnets by their nets' ids (`dbNet*`: a rename keeps it), as the callbacks keep them
+        if report.net_ids_before.len() != old.nets.len() {
+            return refuse("the design's nets are not the block's: net ids unaligned");
+        }
+        let mut net_ids: Vec<u32> = c.nets.iter().map(|e| report.net_ids_before[e.0]).collect();
+        let new_net_of_id: HashMap<u32, usize> = report.net_ids_after.iter().enumerate().map(|(k, &id)| (id, k)).collect();
+        let event_id = |f: &[&str]| f.last().and_then(|x| x.parse::<u32>().ok());
+        let mut created: Vec<(String, usize)> = Vec::new();
+        for ev in events {
+            let f: Vec<&str> = ev.split('|').collect();
+            match f.as_slice() {
+                ["inst_create", name, ..] => {
+                    let Some(&k) = new_ix.get(name) else { return refuse(format!("{name}: an instance the resizer created and removed in one call is not modelled")) };
+                    let di = &new.insts[k];
+                    if !di.core_auto_placeable {
+                        continue;
+                    }
+                    // `Instance(db_inst)` (`copyDbLocation`: padded) → `GCell(inst)`
+                    let mut inst = crate::placer_base::Instance { db: Some(k), lx: di.bbox.lx, ly: di.bbox.ly, ux: di.bbox.lx + di.bbox.dx(), uy: di.bbox.ly + di.bbox.dy(), fixed: di.fixed, macro_: di.master_is_block, locked: false };
+                    if inst.is_place_instance() {
+                        inst.lx -= pad_left * c.site_x;
+                        inst.ux += pad_right * c.site_x;
+                    }
+                    out.delta_area += i64::from(inst.ux - inst.lx) * i64::from(inst.uy - inst.ly);
+                    c.insts.push(inst.clone());
+                    let ck = c.insts.len() - 1;
+                    // `moveGCell` on the resizer's `setLocation`: every box the database's
+                    let b = di.bbox;
+                    let gi = self.gcells.len();
+                    self.gcells.push(GCell { inst: Some(ck), macro_: inst.macro_, lx: b.lx, ly: b.ly, ux: b.ux, uy: b.uy, dlx: b.lx, dly: b.ly, dux: b.ux, duy: b.uy, ..GCell::default() });
+                    if self.min_rc_cell_size.len() < self.gcells.len() {
+                        self.min_rc_cell_size.resize(self.gcells.len(), (0, 0));
+                    }
+                    let nb = match di.group {
+                        None => self.nbs.iter().position(|nb| nb.group.is_none()),
+                        Some(g) => self.nbs.iter().position(|nb| nb.group.as_deref() == Some(new.groups[g].name.as_str())),
+                    };
+                    let Some(b) = nb else { return refuse(format!("{}: a new instance outside the placer's regions is not modelled", di.name)) };
+                    // `NesterovBase::createCbkGCell`: appended, with every per-cell vector
+                    self.nbs[b].append_cell(gi);
+                    cell_of.insert(name.to_string(), gi);
+                    created.push((name.to_string(), b));
+                    out.created += 1;
+                }
+                ["inst_destroy", name] => {
+                    let Some(gi) = cell_of.remove(*name) else { continue };
+                    for nb in self.nbs.iter_mut() {
+                        let Some(i) = nb.cells.iter().position(|&x| x == gi) else { continue };
+                        if nb.io.is_some() {
+                            return refuse(format!("{name}: an instance removed beside IO pin cells is not modelled"));
+                        }
+                        nb.destroy_cell(i);
+                    }
+                    // `NesterovBaseCommon::destroyCbkGCell`: the cell's area off `delta_area_`, the
+                    // last cell swapped into its slot
+                    let g = &self.gcells[gi];
+                    out.delta_area -= i64::from(g.dx()) * i64::from(g.dy());
+                    out.deleted += 1;
+                    for p in g.pins.clone() {
+                        self.gpins[p].gcell = None;
+                    }
+                    if let Some(k) = g.inst {
+                        c.insts[k].db = None;
+                    }
+                    let last = self.gcells.len() - 1;
+                    if self.min_rc_cell_size.len() == self.gcells.len() {
+                        self.min_rc_cell_size.swap_remove(gi);
+                    }
+                    self.gcells.swap_remove(gi);
+                    if gi != last {
+                        self.renumber_cell(last, gi);
+                        for v in cell_of.values_mut() {
+                            if *v == last {
+                                *v = gi;
+                            }
+                        }
+                    }
+                }
+                ["net_create", name, _] => {
+                    let Some(id) = event_id(&f) else { return refuse(format!("{name}: a net callback without its id")) };
+                    // `createGNet`: a signal or clock net (a net gone again by the call's end is a
+                    // resizer net: a signal)
+                    if new_net_of_id.get(&id).is_none_or(|&k| new.nets[k].signal_or_clock) && !net_ids.contains(&id) {
+                        net_ids.push(id);
+                        self.gnets.push(GNet { custom_weight: 1.0, timing_weight: 1.0, ..GNet::default() });
+                        c.nets.push((usize::MAX, 0));
+                    }
+                }
+                ["net_destroy", name, _, _] => {
+                    let Some(id) = event_id(&f) else { return refuse(format!("{name}: a net callback without its id")) };
+                    // `destroyCbkGNet`: the last gnet swapped into its slot
+                    if let Some(g) = net_ids.iter().position(|&n| n == id) {
+                        net_ids.swap_remove(g);
+                        self.gnets.swap_remove(g);
+                        c.nets.swap_remove(g);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.new_cells = created.iter().filter_map(|(n, b)| cell_of.get(n).map(|&gi| (*b, gi))).collect();
+        // nets: each gnet on its net in the new design
+        let mut gnet_of_design: HashMap<usize, usize> = HashMap::new();
+        for (g, id) in net_ids.iter().enumerate() {
+            let Some(&n) = new_net_of_id.get(id) else { return refuse(format!("net id {id}: a net the resizer removed without a callback is not modelled")) };
+            c.nets[g].0 = n;
+            gnet_of_design.insert(n, g);
+        }
+        if let Some(n) = new.nets.iter().enumerate().find(|(k, n)| n.signal_or_clock && !gnet_of_design.contains_key(k)) {
+            return refuse(format!("{}: a net the resizer created without a callback is not modelled", n.1.name));
+        }
+        // pins: the new instances' terminals appended (`createCbkITerm`), in their order
+        let mut key_ix: HashMap<PinKey, usize> = self.pin_keys.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
+        let mut inst_terms: HashMap<usize, Vec<(usize, usize, Option<crate::placer_base::Rect>)>> = HashMap::new();
+        for (k, n) in new.nets.iter().enumerate() {
+            if !n.signal_or_clock {
+                continue;
+            }
+            for t in &n.iterms {
+                inst_terms.entry(t.inst).or_default().push((t.order, k, t.shape));
+            }
+        }
+        for v in inst_terms.values_mut() {
+            v.sort_by_key(|x| x.0);
+        }
+        let cell_of_db: HashMap<usize, usize> = self.gcells.iter().enumerate().filter_map(|(gi, g)| g.inst.and_then(|k| c.insts[k].db).map(|db| (db, gi))).collect();
+        for (k, di) in new.insts.iter().enumerate() {
+            if old_names.contains(di.name.as_str()) {
+                continue;
+            }
+            for &(order, _, shape) in inst_terms.get(&k).map(Vec::as_slice).unwrap_or(&[]) {
+                let (off_x, off_y, cx, cy) = crate::initial_place::iterm_pin(new, k, shape);
+                key_ix.insert(PinKey::Inst(di.name.clone(), order), self.gpins.len());
+                self.pin_keys.push(PinKey::Inst(di.name.clone(), order));
+                self.gpins.push(GPin { cx, cy, off_x, off_y, gcell: cell_of_db.get(&k).copied(), ..GPin::default() });
+                self.pin_net.push(0);
+            }
+        }
+        // `fixPointers`: the cells' pins, the pins' cells and nets, the nets' pins
+        for gi in 0..self.gcells.len() {
+            let Some(k) = self.gcells[gi].inst else { continue };
+            let members = if self.gcells[gi].members.is_empty() { vec![k] } else { self.gcells[gi].members.clone() };
+            let mut pins = Vec::new();
+            for m in members {
+                let Some(db) = c.insts[m].db else { continue };
+                let name = &new.insts[db].name;
+                for &(order, _, _) in inst_terms.get(&db).map(Vec::as_slice).unwrap_or(&[]) {
+                    if let Some(&p) = key_ix.get(&PinKey::Inst(name.clone(), order)) {
+                        pins.push(p);
+                        self.gpins[p].gcell = Some(gi);
+                    }
+                }
+            }
+            self.gcells[gi].pins = pins;
+        }
+        for (k, n) in new.nets.iter().enumerate() {
+            let Some(&g) = gnet_of_design.get(&k) else { continue };
+            let mut pins = Vec::new();
+            for t in &n.iterms {
+                if let Some(&p) = key_ix.get(&PinKey::Inst(new.insts[t.inst].name.clone(), t.order)) {
+                    pins.push(p);
+                    self.pin_net[p] = g;
+                }
+            }
+            for b in &n.bterms {
+                if let Some(&p) = key_ix.get(&PinKey::Port(b.name.clone())) {
+                    pins.push(p);
+                    self.pin_net[p] = g;
+                }
+            }
+            c.nets[g].1 = pins.len();
+            self.gnets[g].pins = pins;
+        }
+        c.pins = self.gpins.len();
+        Ok(out)
+    }
+
+    /// The common cell `from` now at `to` (swapped into a destroyed cell's slot): every index
+    /// that names it — the regions' cells, the pins' cells, the removed fillers, the IO cells.
+    fn renumber_cell(&mut self, from: usize, to: usize) {
+        for nb in self.nbs.iter_mut() {
+            for x in nb.cells.iter_mut().chain(nb.removed_fillers.iter_mut().map(|f| &mut f.cell)) {
+                if *x == from {
+                    *x = to;
+                }
+            }
+            if let Some(io) = nb.io.as_mut() {
+                for x in io.cells.iter_mut() {
+                    if *x == from {
+                        *x = to;
+                    }
+                }
+            }
+        }
+        for p in self.gpins.iter_mut() {
+            if p.gcell == Some(from) {
+                p.gcell = Some(to);
+            }
+        }
+    }
+
+    /// `NesterovBase::updateGCellState` for each new cell of region `b`: its pins at the
+    /// database's terminals, its density size, inside the bins, every slot at its density centre,
+    /// its current gradient, a step back along it (kept inside) as its previous point — the cell
+    /// moved there — and its previous gradient.
+    fn update_gcell_state(&mut self, b: usize, cells: &[usize]) {
+        for &gi in cells {
+            let Some(i) = self.nbs[b].cells.iter().position(|&x| x == gi) else { continue };
+            update_density_size_one(&mut self.gcells[gi], &self.nbs[b]);
+            self.update_density_coordi_layout_inside(b, i);
+            let g = &self.gcells[gi];
+            let (dcx, dcy) = (g.d_cx(), g.d_cy());
+            for k in 0..g.pins.len() {
+                let p = self.gcells[gi].pins[k];
+                self.gpins[p].cx = dcx + self.gpins[p].off_x;
+                self.gpins[p].cy = dcy + self.gpins[p].off_y;
+            }
+            let pt = FloatPoint::new(dcx as f32, dcy as f32);
+            {
+                let nb = &mut self.nbs[b];
+                nb.cur_slp[i] = pt;
+                nb.prev_slp[i] = pt;
+                nb.cur[i] = pt;
+            }
+            let (wl, den, sum) = self.single_gradient(b, i);
+            {
+                let nb = &mut self.nbs[b];
+                nb.cur_slp_wl[i] = wl;
+                nb.cur_slp_den[i] = den;
+                nb.cur_slp_sum[i] = sum;
+            }
+            let c = self.initial_prev_coordi_update_coef;
+            let px = self.nbs[b].cur_slp[i].x - c * self.nbs[b].cur_slp_sum[i].x;
+            let py = self.nbs[b].cur_slp[i].y - c * self.nbs[b].cur_slp_sum[i].y;
+            let q = FloatPoint::new(self.inside_x(b, i, px), self.inside_y(b, i, py));
+            self.nbs[b].prev_slp[i] = q;
+            self.set_density_center(b, i, q.x as i32, q.y as i32);
+            let (wl, den, sum) = self.single_gradient(b, i);
+            let nb = &mut self.nbs[b];
+            nb.prev_slp_wl[i] = wl;
+            nb.prev_slp_den[i] = den;
+            nb.prev_slp_sum[i] = sum;
+        }
+    }
+
+    /// `updateSingleGradient`: one cell's WA gradient (from the forces as the last iteration
+    /// left them), density gradient, and their preconditioned sum — zero for a locked cell.
+    fn single_gradient(&self, b: usize, i: usize) -> (FloatPoint, FloatPoint, FloatPoint) {
+        let gi = self.nbs[b].cells[i];
+        let g = &self.gcells[gi];
+        if g.locked {
+            return (FloatPoint::default(), FloatPoint::default(), FloatPoint::default());
+        }
+        let wl = self.wl_gradient(gi, &self.pin_net);
+        let den = self.density_gradient(b, i);
+        let p = self.nbs[b].density_penalty;
+        let mut sum = FloatPoint::new(wl.x + p * den.x, wl.y + p * den.y);
+        let wl_pre = g.pins.len() as f32;
+        let area = g.dx() as f32 * g.dy() as f32;
+        sum.x /= (wl_pre + p * area).max(MIN_PRECONDITIONER);
+        sum.y /= (wl_pre + p * area).max(MIN_PRECONDITIONER);
+        (wl, den, sum)
+    }
+
+    /// `executeTimingDriven`'s weights: the worst nets (by slack, ties by block order), the worst
+    /// slack (GPL-0106); every net with more than one pin weighted from its driver's slack. False
+    /// when there are no slacks (GPL-0105, GPL-0102).
+    fn timing_weights(&mut self, log: &mut Log, slacks: &[(String, f32)], c: &Common, design: &Design, st: &crate::timing_driven::TdState) -> bool {
+        let worst = crate::timing_driven::worst_slack_nets(slacks, st.nets_percentage);
+        if worst.is_empty() {
+            log.warn("GPL", 105, "Timing-driven: no net slacks found. Timing-driven mode disabled.");
+            return false;
+        }
+        let slack_min = slacks[worst[0]].1;
+        let slack_max = slacks[*worst.last().expect("a worst net")].1;
+        log.info("GPL", 106, format!("Timing-driven: worst slack {}", crate::timing_driven::fmt_float(slack_min)));
+        if slack_min >= 1e30f32 * 0.999 {
+            log.warn("GPL", 102, "Timing-driven: no slacks found. Timing-driven mode disabled.");
+            return false;
+        }
+        let by_name: HashMap<&str, f32> = slacks.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let mut weighted = 0;
+        for (g, gnet) in self.gnets.iter_mut().enumerate() {
+            gnet.timing_weight = 1.0;
+            if gnet.pins.len() > 1 {
+                let name = design.nets[c.nets[g].0].name.as_str();
+                let Some(&s) = by_name.get(name) else { continue };
+                if let Some(w) = crate::timing_driven::timing_weight(s, slack_min, slack_max, st.net_weight_max) {
+                    gnet.timing_weight = w;
+                    weighted += 1;
+                }
+                let total = gnet.total_weight();
+                log.debug("GPL", "timing", 1, || format!("net:{name} slack:{} weight:{}", crate::timing_driven::fmt_float(s), crate::timing_driven::fmt_float(total)));
+            }
+        }
+        log.debug("GPL", "timing", 1, || format!("Timing-driven: weighted {weighted} nets."));
+        true
+    }
+
+    /// `NesterovPlace::runTimingDriven` at an overflow that triggers a reweight (outside a
+    /// routability iteration): GPL-0100/0101, the resizer's repair and slacks, the edits taken in,
+    /// the weights; then each region's new cells set up, its target density from the area the
+    /// resizer added (GPL-0107..0110) and the minimum-HPWL snapshot moved here when overflow is
+    /// at most 0.25. A virtual iteration (the resizer's changes rolled back) is refused.
+    fn run_timing_driven(&mut self, log: &mut Log, d: &Design, td: &mut TimingDriven<'_>, iter: i32, td_count: &mut i32, td_delta: &mut i64) -> Res<()> {
+        if !td.state.enabled || !td.state.is_overflow_trigger(self.average_overflow_unscaled) {
+            return Ok(());
+        }
+        let virtual_td = self.average_overflow_unscaled > td.state.keep_resize_below_overflow;
+        if virtual_td {
+            return refuse("a virtual timing-driven iteration (the resizer's changes rolled back) is not modelled");
+        }
+        td.state.counter += 1;
+        log.info("GPL", 100, format!("Timing-driven iteration {}/{}, virtual: {}.", td.state.counter, td.state.overflows.len(), virtual_td));
+        let hpwl = self.hpwl();
+        log.info("GPL", 101, format!("   Iter: {}, overflow: {:.3}, keep resizer changes at: {}, HPWL: {}", iter + 1, self.average_overflow_unscaled, crate::timing_driven::fmt_float(td.state.keep_resize_below_overflow), hpwl));
+        let nbc_before = self.gcells.iter().filter(|g| g.is_instance()).count() as i32;
+        let nb_before: usize = self.nbs.iter().map(|nb| nb.cells.len()).sum();
+        let repair = td.state.counter == td.state.overflows.len() as i32 && td.state.repair_timing;
+        let locations = placed_locations(td.common, self);
+        let report = td.router.find_resize_slacks(log, &locations, repair, td.state.repair_tns_end_percent)?;
+        for l in &report.lines {
+            log.report(l.clone());
+        }
+        let absorbed = self.absorb_netlist(&td.design, &report.design, &report, td.common, td.pad_right)?;
+        td.design = report.design;
+        let proceed = self.timing_weights(log, &report.slacks, td.common, &td.design, &td.state);
+        let _ = d;
+        self.nbs[0].reprint_header = true;
+        *td_count += 1;
+        let nbc_delta = absorbed.created - absorbed.deleted;
+        *td_delta += absorbed.delta_area;
+        let nb_after: usize = self.nbs.iter().map(|nb| nb.cells.len()).sum();
+        let nb_delta = nb_after as i32 - nb_before as i32;
+        if nb_delta != nbc_delta {
+            log.warn("GPL", 92, format!("Mismatch in #cells between central object and all regions. NesterovBaseCommon: {nbc_delta}, Summing all regions: {nb_delta}"));
+        }
+        let mut delta_area = absorbed.delta_area;
+        let mut created = absorbed.created;
+        for b in 0..self.nbs.len() {
+            let cells: Vec<usize> = absorbed.new_cells.iter().filter(|x| x.0 == b).map(|x| x.1).collect();
+            self.update_gcell_state(b, &cells);
+            let nb = &self.nbs[b];
+            let density = (delta_area + nesterov_insts_area(nb) + nb.total_filler_area) as f32 / nb.white_space_area as f32;
+            self.set_target_density(b, density);
+            let nb = &mut self.nbs[b];
+            nb.movable_area = (nb.target_density * nb.white_space_area as f32) as i64;
+            let microns = dbu_area(d, delta_area as f64) as f32;
+            let pct = (delta_area as f32 / nesterov_insts_area(nb) as f32) * 100.0f32;
+            log.info("GPL", 107, format!("Timing-driven: repair_design delta area: {microns:.3} um^2 ({pct:+.2}%)"));
+            let gpct = if nbc_before > 0 { (nbc_delta as f32 / nbc_before as f32) * 100.0f32 } else { 0.0 };
+            log.info("GPL", 108, format!("Timing-driven: repair_design, gpl delta gcells: {nbc_delta} ({gpct:+.2}%)"));
+            log.info("GPL", 109, format!("Timing-driven: repair_design, gcells created: {created}, deleted: {}", absorbed.deleted));
+            log.info("GPL", 110, format!("Timing-driven: new target density: {}", crate::timing_driven::fmt_float(nb.target_density)));
+            delta_area = 0;
+            created = 0;
+            self.update_areas(b);
+            update_density_size(&mut self.gcells, &self.nbs[b]);
+        }
+        let hpwl = self.hpwl();
+        if f64::from(self.average_overflow_unscaled) <= 0.25 {
+            self.min_hpwl = hpwl;
+            self.diverge_snapshot_overflow = self.average_overflow_unscaled;
+            self.diverge_snapshot_iter = iter + 1;
+            self.is_min_hpwl = true;
+        }
+        if !proceed {
+            td.state.enabled = false;
+        }
+        Ok(())
+    }
+}
+
+/// `updateDensitySize` for one cell.
+fn update_density_size_one(g: &mut GCell, nb: &Nb) {
+    let (bsx, bsy) = (nb.bg.size_x, nb.bg.size_y);
+    let thr_x = ld::SQRT2.times(Ld::from_f64(bsx));
+    let thr_y = ld::SQRT2.times(Ld::from_f64(bsy));
+    let size_x = ld::SQRT2.times(Ld::from_f32(bsx as f32)).to_f32();
+    let size_y = ld::SQRT2.times(Ld::from_f32(bsy as f32)).to_f32();
+    let (dx, dy) = (g.dx(), g.dy());
+    let (scale_x, dsx) = if Ld::from_u64(dx as u64) < thr_x { (dx as f32 / thr_x.to_f32(), size_x) } else { (1.0, dx as f32) };
+    let (scale_y, dsy) = if Ld::from_u64(dy as u64) < thr_y { (dy as f32 / thr_y.to_f32(), size_y) } else { (1.0, dy as f32) };
+    g.set_density_size(dsx as i32, dsy as i32);
+    g.density_scale = scale_x * scale_y;
+}
+
 /// `GCell::setSize`: the box resized about its own (integer) centre — halves truncated, so an odd
 /// size loses one. The density box is left to `updateDensitySize`.
 fn set_size(g: &mut GCell, dx: i32, dy: i32) {
@@ -2995,12 +3495,12 @@ pub fn placed_locations(c: &Common, nb: &Nesterov) -> Vec<(usize, i32, i32)> {
 /// `Replace::doNesterovPlace` from GPL-0084 (the placer is built): the reference HPWL, the
 /// placer's init, then the loop — `NesterovPlace::doNesterovPlace` — and its report. Returns the
 /// final iteration.
-pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, route: Option<&mut Routability<'_>>) -> Res<i32> {
+pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, route: Option<&mut Routability<'_>>, td: Option<&mut TimingDriven<'_>>) -> Res<i32> {
     // `NesterovPlaceVars`: the reference HPWL, from the design's own (initial) HPWL when unset.
     let design_hpwl = np.hpwl();
     np.reference_hpwl = if np.o.reference_hpwl > 0.0 { np.o.reference_hpwl } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) };
     np.np_init(log)?;
-    resume_nesterov_place(log, d, np, 0, route)
+    resume_nesterov_place(log, d, np, 0, route, td)
 }
 
 /// `Replace::doNesterovPlace` again on the placer that already exists (`initNesterovPlace` finds
@@ -3009,7 +3509,7 @@ pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, route: Op
 pub fn continue_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, overflow: f32, max_iter: i32, start_iter: i32) -> Res<i32> {
     np.o.overflow = overflow;
     np.max_iter = max_iter;
-    resume_nesterov_place(log, d, np, start_iter, None)
+    resume_nesterov_place(log, d, np, start_iter, None, None)
 }
 
 /// `PlacerBase::unlockAll` for every region: no cell (and no instance) locked.
@@ -3031,8 +3531,12 @@ pub struct Routability<'a> {
 }
 
 /// `NesterovPlace::doNesterovPlace(start_iter)` with GPL-0084 before it.
-fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_iter: i32, mut route: Option<&mut Routability<'_>>) -> Res<i32> {
+fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_iter: i32, mut route: Option<&mut Routability<'_>>, mut td: Option<&mut TimingDriven<'_>>) -> Res<i32> {
     log.info("GPL", 84, "---- Execute Nesterov Global Placement.");
+    // `Replace::doNesterovPlace`: in timing-driven mode, `Resizer::resizeSlackPreamble` next
+    if let Some(t) = td.as_mut() {
+        t.router.resize_slack_preamble(log)?;
+    }
     if np.num_region_diverged > 0 {
         let (code, msg) = np.diverge.unwrap_or((0, ""));
         return log.error("GPL", code, msg);
@@ -3049,6 +3553,8 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
     // the routability snapshot: saved, its WA coefficients and step parameter
     let (mut route_saved, mut route_snap, mut route_snap_a) = (false, (0f32, 0f32), 0f32);
     let (mut route_iters, mut route_reverts) = (0i32, 0i32);
+    // timing-driven: the reweights run, the area they added
+    let (mut td_count, mut td_delta) = (0i32, 0i64);
     let mut cur_a = 1.0f32;
     let mut iter = start_iter;
     while iter < np.max_iter {
@@ -3068,9 +3574,16 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         }
         let routability = np.o.routability.is_some();
         // `is_routability_gpl_iter`: each such iteration extends the limit by one
-        if route_saved && np.average_overflow_unscaled > np.o.routability_end_overflow {
+        let routability_gpl_iter = route_saved && np.average_overflow_unscaled > np.o.routability_end_overflow;
+        if routability_gpl_iter {
             route_iters += 1;
             np.max_iter += 1;
+        }
+        // `runTimingDriven`, outside a routability iteration
+        if let Some(t) = td.as_mut() {
+            if !routability_gpl_iter || !routability {
+                np.run_timing_driven(log, d, t, iter, &mut td_count, &mut td_delta)?;
+            }
         }
         if np.np_is_diverged(log, &mut saved, &mut snap) {
             break;
@@ -3127,11 +3640,18 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
     if iter >= np.max_iter {
         log.warn("GPL", 1010, format!("GPL reached the maximum number of iterations for nesterov {}. Placement may have failed to converge.", np.max_iter));
     }
-    if let Some(r) = route.as_ref() {
+    let td_on = td.as_ref().is_some_and(|t| t.state.enabled);
+    if route.is_some() || td_on {
         log.info("GPL", 1011, format!("Original area (um^2): {:.2}", dbu_area(d, original_area as f64)));
+    }
+    if let Some(r) = route.as_ref() {
         let inflation = r.rb.total_inflation();
         let pct = (100.0 * inflation as f64 / original_area as f64) as f32;
         log.info("GPL", 1012, format!("Total routability artificial inflation: {:.2} ({:+.2}%)", dbu_area(d, inflation as f64), pct));
+    }
+    if td_on {
+        let pct = (100.0 * td_delta as f64 / original_area as f64) as f32;
+        log.info("GPL", 1013, format!("Total timing-driven delta area: {:.2} ({:+.2}%)", dbu_area(d, td_delta as f64), pct));
     }
     let new_area: i64 = np.nbs.iter().map(nesterov_insts_area).sum();
     let diff = (100.0 * (new_area - original_area) as f64 / original_area as f64) as f32;

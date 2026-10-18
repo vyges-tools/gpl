@@ -81,7 +81,7 @@ fn orient_point(orient: &str, x: i32, y: i32) -> (i32, i32) {
 /// `Pin::updateCoordi(dbITerm)`: the shapes' box rotated about the master centre with the
 /// instance; the offset is its centre less the master centre; the pin sits at the instance's
 /// database lower-left plus the master centre plus the offset.
-fn iterm_pin(d: &Design, inst: usize, shape: Option<Rect>) -> (i32, i32, i32, i32) {
+pub(crate) fn iterm_pin(d: &Design, inst: usize, shape: Option<Rect>) -> (i32, i32, i32, i32) {
     let di = &d.insts[inst];
     let (icx, icy) = (di.master_w / 2, di.master_h / 2);
     let (ox, oy) = match shape {

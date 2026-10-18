@@ -39,6 +39,9 @@ pub enum Outcome {
     /// Nesterov placement ran: the placer, its bases, each placed instance's database location
     /// (design instance, lower-left) and the final iteration.
     Placed(Common, Vec<Base>, Vec<(usize, i32, i32)>, i32, Vec<IoWrite>),
+    /// Placed after the resizer edited the netlist (timing-driven): the locations index the
+    /// design as it now stands.
+    PlacedEdited(Common, Vec<Base>, Vec<(usize, i32, i32)>, i32, Vec<IoWrite>, Box<Design>),
     /// Incremental placement found every instance placed (GPL-0156): the command ends with the
     /// placer built and nothing moved.
     Unchanged(Common, Vec<Base>),
@@ -148,16 +151,26 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
                 log.info("GPL", 168, "Concurrent IO placement enabled.");
             }
             let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases, &o)?;
-            let iter = match (o.routability, router) {
-                (Some(vars), Some(router)) => {
+            let td = td_state(&keys, &flags)?;
+            let iter = match (o.routability, td, router) {
+                (Some(_), Some(_), _) => return refuse("-routability_driven with -timing_driven is not modelled"),
+                (Some(vars), None, Some(router)) => {
                     // `RouteBase` is built with the placer; RUDY's router on its first pass
                     let mut rb = RouteBase::new(vars);
                     nb.route_base_init(&mut rb);
                     let mut r = nesterov::Routability { rb, router, common: &c };
-                    nesterov::do_nesterov_place(log, d, &mut nb, Some(&mut r))?
+                    nesterov::do_nesterov_place(log, d, &mut nb, Some(&mut r), None)?
                 }
-                (Some(_), None) => return refuse("-routability_driven needs the design database's router"),
-                (None, _) => nesterov::do_nesterov_place(log, d, &mut nb, None)?,
+                (None, Some(state), Some(router)) => {
+                    let mut t = nesterov::TimingDriven { state, router, common: &mut c, design: d.clone(), pad_right: vars.pad_right };
+                    let iter = nesterov::do_nesterov_place(log, d, &mut nb, None, Some(&mut t))?;
+                    let design = t.design;
+                    let locations = nesterov::placed_locations(&c, &nb);
+                    let io = nesterov::io_pin_writes(&mut nb);
+                    return Ok(Outcome::PlacedEdited(c, bases, locations, iter, io, Box::new(design)));
+                }
+                (_, _, None) => return refuse("-routability_driven / -timing_driven need the design database"),
+                (None, None, _) => nesterov::do_nesterov_place(log, d, &mut nb, None, None)?,
             };
             let locations = nesterov::placed_locations(&c, &nb);
             let io = nesterov::io_pin_writes(&mut nb);
@@ -167,9 +180,30 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     }
 }
 
+/// `-timing_driven`'s options (`TimingBase`): the reweight overflows (a list of percents), the
+/// maximum weight, the share of nets weighted, the overflow below which the resizer's changes are
+/// kept, the setup repair at the last reweight.
+fn td_state(keys: &BTreeMap<String, String>, flags: &[String]) -> Res<Option<crate::timing_driven::TdState>> {
+    if !flags.iter().any(|x| x == "-timing_driven") {
+        return Ok(None);
+    }
+    let float = |k: &str, d: f32| -> Res<f32> { keys.get(k).map_or(Ok(d), |s| s.trim().parse::<f32>().or_else(|_| refuse(format!("{k} {s}: not a number")))) };
+    let overflows: Vec<i32> = match keys.get("-timing_driven_net_reweight_overflow") {
+        Some(list) => list.split_whitespace().map(|w| w.parse::<i32>()).collect::<Result<_, _>>().or_else(|_| refuse(format!("-timing_driven_net_reweight_overflow {list}: not integers")))?,
+        None => vec![64, 20],
+    };
+    let mut st = crate::timing_driven::TdState::new(&overflows);
+    st.net_weight_max = float("-timing_driven_net_weight_max", st.net_weight_max)?;
+    st.nets_percentage = float("-timing_driven_nets_percentage", st.nets_percentage)?;
+    st.keep_resize_below_overflow = float("-keep_resize_below_overflow", st.keep_resize_below_overflow)?;
+    st.repair_tns_end_percent = float("-timing_driven_repair_tns_end_percent", st.repair_tns_end_percent)?;
+    st.repair_timing = flags.iter().any(|x| x == "-timing_driven_repair_timing");
+    Ok(Some(st))
+}
+
 /// `getOptions` for the plain Nesterov mode; the modes it does not model are refused.
 fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) -> Res<nesterov::Opts> {
-    for f in ["-timing_driven", "-timing_driven_repair_timing", "-virtual_cts", "-enable_routing_congestion"] {
+    for f in ["-virtual_cts", "-enable_routing_congestion"] {
         if flags.iter().any(|x| x == f) {
             return refuse(format!("global_placement {f} is not modelled"));
         }
@@ -295,7 +329,7 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     check_place_ios_supported(log, d, v)?;
     let mut ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
     let mut np = nesterov::init_nesterov_place(log, d, &mut common, &mut ip, &bases, &locked)?;
-    let mut iter = nesterov::do_nesterov_place(log, d, &mut np, None)?;
+    let mut iter = nesterov::do_nesterov_place(log, d, &mut np, None, None)?;
     // `updateDb` then `reportHpwlMetric` at the end of this pass
     let Some(router) = router else { return refuse("-incremental needs the design database to write between its passes") };
     router.write_locations(log, &nesterov::placed_locations(&common, &np))?;

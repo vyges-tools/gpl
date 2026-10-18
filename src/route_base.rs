@@ -100,6 +100,17 @@ pub trait Router {
     /// `getGrtResult`'s route: the database updated, `globalRoute` with congestion allowed, no
     /// congestion iterations and no critical nets — and the gcell grid it leaves.
     fn global_route(&mut self, log: &mut Log, locations: &[(usize, i32, i32)]) -> Res<GrtCongestion>;
+    /// `Resizer::resizeSlackPreamble` (timing-driven placement, after GPL-0084): its warnings
+    /// (RSZ-0088) and its error (RSZ-0089, no corner with a wire resistance) as it logs them.
+    fn resize_slack_preamble(&mut self, _log: &mut Log) -> Res<()> {
+        crate::log::refuse("timing-driven placement needs the design database's resizer")
+    }
+    /// `Resizer::findResizeSlacks` (timing-driven placement's reweight): the instances written,
+    /// the estimate, repair_design at the preamble's wire length, the placement-time rebuffering
+    /// (and, asked, one setup repair pass), then each driver's slack; the design re-read.
+    fn find_resize_slacks(&mut self, _log: &mut Log, _locations: &[(usize, i32, i32)], _repair_timing: bool, _tns_end_percent: f32) -> Res<crate::timing_driven::ResizeReport> {
+        crate::log::refuse("timing-driven placement needs the design database's resizer")
+    }
     /// `dbNet::getTermBBox` of every net that is not POWER or GROUND, in block order, with its
     /// index among the block's nets — an inverted box for a net with no placed terminal.
     fn net_term_boxes(&mut self) -> Res<Vec<(usize, Box4)>>;
