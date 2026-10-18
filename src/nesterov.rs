@@ -3107,6 +3107,14 @@ impl Nesterov {
         if virtual_td {
             return refuse("a virtual timing-driven iteration (the resizer's changes rolled back) is not modelled");
         }
+        // `ClockBase::executeVirtualCts` on the database's locations (`updateDb` first)
+        if let Some(fraction) = td.state.virtual_cts {
+            let locations = placed_locations(td.common, self);
+            if td.router.virtual_cts(log, &locations, fraction)? {
+                td.state.virtual_cts_count += 1;
+                log.info("GPL", 164, format!("Virtual CTS iteration {}, overflow: {:.3}.", td.state.virtual_cts_count, self.average_overflow_unscaled));
+            }
+        }
         td.state.counter += 1;
         log.info("GPL", 100, format!("Timing-driven iteration {}/{}, virtual: {}.", td.state.counter, td.state.overflows.len(), virtual_td));
         let hpwl = self.hpwl();

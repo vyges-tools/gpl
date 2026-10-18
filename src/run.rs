@@ -151,7 +151,21 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
                 log.info("GPL", 168, "Concurrent IO placement enabled.");
             }
             let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases, &o)?;
-            let td = td_state(&keys, &flags)?;
+            let mut td = td_state(&keys, &flags)?;
+            // `initNesterovPlace`: the virtual clock tree's skew fraction, clamped (GPL-0165)
+            if flags.iter().any(|x| x == "-virtual_cts") {
+                let mut f = match keys.get("-virtual_cts_max_skew_fraction") {
+                    Some(s) => s.trim().parse::<f32>().or_else(|_| refuse(format!("-virtual_cts_max_skew_fraction {s}: not a number")))?,
+                    None => 0.10,
+                };
+                if f < 0.0 || f > 1.0 {
+                    log.warn("GPL", 165, format!("virtual_cts_max_skew_fraction {f} out of range [0, 1]; clamping."));
+                    f = f.clamp(0.0, 1.0);
+                }
+                if let Some(t) = td.as_mut() {
+                    t.virtual_cts = Some(f);
+                }
+            }
             let iter = match (o.routability, td, router) {
                 (Some(_), Some(_), _) => return refuse("-routability_driven with -timing_driven is not modelled"),
                 (Some(vars), None, Some(router)) => {
@@ -203,10 +217,8 @@ fn td_state(keys: &BTreeMap<String, String>, flags: &[String]) -> Res<Option<cra
 
 /// `getOptions` for the plain Nesterov mode; the modes it does not model are refused.
 fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) -> Res<nesterov::Opts> {
-    for f in ["-virtual_cts", "-enable_routing_congestion"] {
-        if flags.iter().any(|x| x == f) {
-            return refuse(format!("global_placement {f} is not modelled"));
-        }
+    if flags.iter().any(|x| x == "-enable_routing_congestion") {
+        return refuse("global_placement -enable_routing_congestion is not modelled");
     }
     let float = |k: &str, d: f32| -> Res<f32> { keys.get(k).map_or(Ok(d), |s| s.trim().parse::<f32>().or_else(|_| refuse(format!("{k} {s}: not a number")))) };
     let int = |k: &str, d: i32| -> Res<i32> { keys.get(k).map_or(Ok(d), |s| s.trim().parse::<i32>().or_else(|_| refuse(format!("{k} {s}: not an integer")))) };

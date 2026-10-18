@@ -105,6 +105,12 @@ pub trait Router {
     fn resize_slack_preamble(&mut self, _log: &mut Log) -> Res<()> {
         crate::log::refuse("timing-driven placement needs the design database's resizer")
     }
+    /// `ClockBase::executeVirtualCts` (`-virtual_cts`, at a reweight): the instances written, the
+    /// previous virtual latencies dropped, each clock's register clock pins given a latency from
+    /// the placement; GPL-0160 / GPL-0161 / GPL-0162 as it logs them. True when any was set.
+    fn virtual_cts(&mut self, _log: &mut Log, _locations: &[(usize, i32, i32)], _fraction: f32) -> Res<bool> {
+        crate::log::refuse("global_placement -virtual_cts needs the design database's timer")
+    }
     /// `Resizer::findResizeSlacks` (timing-driven placement's reweight): the instances written,
     /// the estimate, repair_design at the preamble's wire length, the placement-time rebuffering
     /// (and, asked, one setup repair pass), then each driver's slack; the design re-read.

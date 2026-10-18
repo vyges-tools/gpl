@@ -33,6 +33,9 @@ pub struct DbRouter<'a> {
     /// The resizer's timer levels as its last call left them: the reference's one timer persists
     /// across the reweights, its incremental levels with it.
     sta_levels: Option<serde_json::Value>,
+    /// The virtual clock tree's latencies in force (`ClockBase::virtual_inserts_`), each reweight's
+    /// resizer job timing under them.
+    clock_latencies: Vec<serde_json::Value>,
     /// A diagnostic: where each resizer call writes its debug trace (`<path>.<call>`, from 1),
     /// at the levels the job's `set_debug_level RSZ ...` steps set.
     pub rsz_trace: Option<String>,
@@ -42,7 +45,7 @@ pub struct DbRouter<'a> {
 
 impl<'a> DbRouter<'a> {
     pub fn new(db: &'a mut Db) -> DbRouter<'a> {
-        DbRouter { db, edges: None, rsz_steps: Vec::new(), rsz_trace: None, rsz_calls: 0, sta_levels: None, read_design: None }
+        DbRouter { db, edges: None, rsz_steps: Vec::new(), rsz_trace: None, rsz_calls: 0, sta_levels: None, clock_latencies: Vec::new(), read_design: None }
     }
 }
 
@@ -125,6 +128,31 @@ impl Router for DbRouter<'_> {
         Ok(())
     }
 
+    fn virtual_cts(&mut self, log: &mut Log, locations: &[(usize, i32, i32)], fraction: f32) -> Res<bool> {
+        use serde_json::json;
+        self.write_locations(log, locations)?;
+        // `removeVirtualCts` first: the latencies of the last reweight are gone whatever follows
+        self.clock_latencies.clear();
+        let mut steps = self.rsz_steps.clone();
+        steps.push(json!({ "cmd": "virtual_cts", "args": [f64::from(fraction).to_string()] }));
+        let db = std::mem::replace(&mut *self.db, Db::new());
+        let (report, db) = vyges_rsz::job::run_owned(&json!({ "steps": steps }), db).map_err(|e| crate::log::Stop::Refused(format!("the virtual clock tree: {e}")))?;
+        *self.db = db;
+        let Some(v) = report.get("virtual_cts") else { return refuse(format!("the virtual clock tree: {}", report["reason"].as_str().unwrap_or("not built"))) };
+        if v["clocks"].as_u64().unwrap_or(0) == 0 {
+            log.warn("GPL", 160, "Virtual CTS: no clocks defined in design. Skipping.");
+            return Ok(false);
+        }
+        let latencies = v["latencies"].as_array().cloned().unwrap_or_default();
+        if latencies.is_empty() {
+            log.warn("GPL", 161, "Virtual CTS: no register clock pins found. Skipping.");
+            return Ok(false);
+        }
+        log.info("GPL", 162, format!("Virtual CTS: set {} virtual clock insertion delays.", latencies.len()));
+        self.clock_latencies = latencies;
+        Ok(true)
+    }
+
     fn find_resize_slacks(&mut self, log: &mut Log, locations: &[(usize, i32, i32)], repair_timing: bool, tns_end_percent: f32) -> Res<crate::timing_driven::ResizeReport> {
         use serde_json::{json, Value};
         let Some(read_design) = self.read_design else { return refuse("timing-driven placement without the design reader") };
@@ -147,6 +175,9 @@ impl Router for DbRouter<'_> {
             steps.push(json!({ "cmd": "fully_rebuffer", "args": ["NULL", "-vyges_resize_slacks"] }));
         }
         let mut job = json!({ "steps": steps });
+        if !self.clock_latencies.is_empty() {
+            job["clock_latencies"] = json!(self.clock_latencies);
+        }
         if let Some(l) = &self.sta_levels {
             job["sta_levels"] = l.clone();
         }

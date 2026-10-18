@@ -36,6 +36,9 @@ pub struct TdState {
     pub counter: i32,
     /// `timingDrivenMode`: cleared when the slacks give out (GPL-0102 / GPL-0105).
     pub enabled: bool,
+    /// `-virtual_cts`: the skew fraction (clamped to [0, 1]); and `virtual_cts_count`.
+    pub virtual_cts: Option<f32>,
+    pub virtual_cts_count: i32,
 }
 
 impl TdState {
@@ -51,7 +54,7 @@ impl TdState {
             v.sort_by(|a, b| b.cmp(a));
         }
         let n = v.len();
-        TdState { overflows: v, fired: vec![false; n], net_weight_max: 5.0, nets_percentage: 10.0, keep_resize_below_overflow: 1.0, repair_timing: false, repair_tns_end_percent: 1.0, counter: 0, enabled: true }
+        TdState { overflows: v, fired: vec![false; n], net_weight_max: 5.0, nets_percentage: 10.0, keep_resize_below_overflow: 1.0, repair_timing: false, repair_tns_end_percent: 1.0, counter: 0, enabled: true, virtual_cts: None, virtual_cts_count: 0 }
     }
 
     /// `isTimingNetWeightOverflow`: the overflow as a rounded percent; true when it has fallen
