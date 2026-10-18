@@ -403,8 +403,9 @@ MODELLED:
   weighted-average wirelength gradient, the accelerated descent with back-tracking, every
   progress row, convergence (GPL-1001..1009) and the final area and HPWL (GPL-1014, 1018) —
   all in the reference's own operation order; region groups each their own Nesterov region
-  (GPL-1016). Refused: -timing_driven, -routability_driven, -virtual_cts,
-  -enable_routing_congestion, -incremental, -place_ios, placement clusters.
+  (GPL-1016); placement clusters; -incremental; -place_ios; -routability_driven (RUDY or
+  -routability_use_grt); -timing_driven (the resizer's repair at each overflow, net
+  reweighting) and -virtual_cts. Refused: -enable_routing_congestion.
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout
@@ -441,7 +442,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of placed, vacuous, refused or error. placed means the command ran to the end: the initial placement (and, unless -skip_nesterov_place, the Nesterov placement to the target overflow) written to the database. The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement, placement clusters routability-driven placement (RUDY or the global router: cell inflation, filler removal, net reweighting, the revert to the best pass) and concurrent IO placement (-place_ios), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -virtual_cts, -enable_routing_congestion."
+    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement, placement clusters, routability-driven placement (RUDY or the global router: cell inflation, filler removal, net reweighting, the revert to the best pass), timing-driven placement (the resizer's repair at each reweight overflow, the worst-slack net reweighting, -virtual_cts) and concurrent IO placement (-place_ios), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -enable_routing_congestion."
   ],
   "invocation": {
     "args_template": ["global_placement", "{job}"],
