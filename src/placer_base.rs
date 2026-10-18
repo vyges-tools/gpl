@@ -102,6 +102,39 @@ pub struct Blockage {
 pub struct Port {
     pub name: String,
     pub bbox: Option<Rect>,
+    /// `getFirstPinPlacementStatus().isFixed()`: LOCKED, FIRM or COVER.
+    pub fixed: bool,
+}
+
+/// A block terminal as concurrent IO placement reads it, in the block's order.
+#[derive(Debug, Clone)]
+pub struct IoPort {
+    pub name: String,
+    /// The design net it is on (index into [`Design::nets`]).
+    pub net: Option<usize>,
+    pub bbox: Option<Rect>,
+    /// `getFirstPinPlacementStatus()`: fixed (LOCKED/FIRM/COVER), placed (those or PLACED).
+    pub fixed: bool,
+    pub placed: bool,
+    /// `getConstraintRegion()`: a degenerate box is an edge interval, a real one an `up:` box.
+    pub constraint: Option<(i32, i32, i32, i32)>,
+    /// `getMirroredBTerm()`, when it has one.
+    pub mirror: Option<String>,
+}
+
+/// What `-place_ios` reads from the block and technology besides the ports.
+#[derive(Debug, Clone, Default)]
+pub struct IoSetup {
+    /// `getBlockedRegionsForPins()`.
+    pub blocked: Vec<(i32, i32, i32, i32)>,
+    /// `getBTermTopLayerGrid()`: its layer, pin width and height, and the layer's width.
+    pub top_grid: Option<(String, i32, i32, i32)>,
+    /// The first horizontal and first vertical routing layer (`pickIoPinDummyLayers`), each
+    /// with its width.
+    pub hor: Option<(String, i32)>,
+    pub ver: Option<(String, i32)>,
+    /// The die polygon's point count (`getDieAreaPolygon`): more than 5 is not a rectangle.
+    pub die_points: usize,
 }
 
 /// One instance terminal on a net: its instance (index into [`Design::insts`]) and the union of
@@ -142,6 +175,9 @@ pub struct Design {
     /// `placement_cluster` lists, in command order: each a list of database instances that the
     /// Nesterov placer moves as ONE cell (`NesterovBaseCommon`'s cluster cells).
     pub clusters: Vec<Vec<usize>>,
+    /// Every block terminal, in block order (`-place_ios`).
+    pub ports: Vec<IoPort>,
+    pub io: IoSetup,
 }
 
 /// The options construction reads.

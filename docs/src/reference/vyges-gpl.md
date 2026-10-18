@@ -27,8 +27,9 @@ MODELLED:
   (GPL-1016); -incremental (GPL-0083, 0154..0156, 0133); placement_cluster (GPL-0094..0096);
   -routability_driven with RUDY or -routability_use_grt: every pass, cell inflation, filler
   removal and restore, congested-net reweighting, the budget and the revert to the minimum
-  (GPL-0038..0099, 1005, 1011, 1012, 1017). Refused: -timing_driven, -virtual_cts,
-  -enable_routing_congestion, -place_ios.
+  (GPL-0038..0099, 1005, 1011, 1012, 1017); -place_ios: IO pin cells on their perimeter or
+  top-layer loci, mirror pairs, excluded regions, the pins written (GPL-0168..0184).
+  Refused: -timing_driven, -virtual_cts, -enable_routing_congestion.
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout

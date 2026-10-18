@@ -37,6 +37,9 @@ impl Default for IpVars {
 pub struct Pin {
     pub inst: Option<usize>,
     pub port: bool,
+    /// `isMovableIoPin`: a port `-place_ios` moves (not fixed) — left out of the bound-to-bound
+    /// model.
+    pub movable_io: bool,
     pub off_x: i32,
     pub off_y: i32,
     pub cx: i32,
@@ -119,7 +122,8 @@ pub fn pins(d: &Design, c: &Common, v: &Vars) -> Ip {
                 // updateCoordi(dbBTerm): the box centre (an unplaced port is refused earlier).
                 let b = p.bbox.unwrap_or_default();
                 list.push(ip.pins.len());
-                ip.pins.push(Pin { port: true, cx: (b.lx + b.ux) / 2, cy: (b.ly + b.uy) / 2, ..Pin::default() });
+                // an unplaced port (`-place_ios`) is the centre of an inverted box: 0
+                ip.pins.push(Pin { port: true, movable_io: v.place_ios && !p.fixed, cx: (b.lx + b.ux) / 2, cy: (b.ly + b.uy) / 2, ..Pin::default() });
             }
         }
         ip.net_pins.push(list);
@@ -207,6 +211,9 @@ pub fn update_pin_info(ip: &mut Ip) {
         let (mut lx, mut ly, mut ux, mut uy) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
         let (mut pmin_x, mut pmin_y, mut pmax_x, mut pmax_y): (Option<usize>, Option<usize>, Option<usize>, Option<usize>) = (None, None, None, None);
         for &k in net {
+            if ip.pins[k].movable_io {
+                continue;
+            }
             let (cx, cy) = (ip.pins[k].cx, ip.pins[k].cy);
             if lx > cx {
                 if let Some(o) = pmin_x {
@@ -280,10 +287,12 @@ pub fn create_sparse_matrix(c: &Common, ip: &Ip, vars: &IpVars) -> (System, Syst
         if net.len() <= 1 || net.len() >= vars.max_fanout {
             continue;
         }
+        // the weight counts every pin; the pairs leave the movable ports out
         let net_weight = vars.net_weight_scale / (net.len() - 1) as f32;
-        for i1 in 1..net.len() {
-            let p1 = &ip.pins[net[i1]];
-            for &k2 in &net[..i1] {
+        let solve: Vec<usize> = net.iter().copied().filter(|&k| !ip.pins[k].movable_io).collect();
+        for i1 in 1..solve.len() {
+            let p1 = &ip.pins[solve[i1]];
+            for &k2 in &solve[..i1] {
                 let p2 = &ip.pins[k2];
                 // The same instance (two ports share "none").
                 if p1.inst == p2.inst {

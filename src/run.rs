@@ -38,7 +38,7 @@ pub enum Outcome {
     InitiallyPlaced(Common, Vec<Base>, Ip, bool),
     /// Nesterov placement ran: the placer, its bases, each placed instance's database location
     /// (design instance, lower-left) and the final iteration.
-    Placed(Common, Vec<Base>, Vec<(usize, i32, i32)>, i32),
+    Placed(Common, Vec<Base>, Vec<(usize, i32, i32)>, i32, Vec<IoWrite>),
     /// Incremental placement found every instance placed (GPL-0156): the command ends with the
     /// placer built and nothing moved.
     Unchanged(Common, Vec<Base>),
@@ -144,6 +144,9 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
     let outcome = do_initial_place(log, d, &vars, &ip, skip_nesterov)?;
     match (outcome, np) {
         (Outcome::InitiallyPlaced(mut c, bases, mut ip, false), Some(o)) => {
+            if o.place_ios {
+                log.info("GPL", 168, "Concurrent IO placement enabled.");
+            }
             let mut nb = nesterov::init_nesterov_place(log, d, &mut c, &mut ip, &bases, &o)?;
             let iter = match (o.routability, router) {
                 (Some(vars), Some(router)) => {
@@ -157,7 +160,8 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
                 (None, _) => nesterov::do_nesterov_place(log, d, &mut nb, None)?,
             };
             let locations = nesterov::placed_locations(&c, &nb);
-            Ok(Outcome::Placed(c, bases, locations, iter))
+            let io = nesterov::io_pin_writes(&mut nb);
+            Ok(Outcome::Placed(c, bases, locations, iter, io))
         }
         (other, _) => Ok(other),
     }
@@ -191,6 +195,7 @@ fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) ->
     o.perturb_dist = float("-perturb_dist", o.perturb_dist)?;
     o.disable_revert_if_diverge = flags.iter().any(|x| x == "-disable_revert_if_diverge");
     o.pad_left = v.pad_left;
+    o.place_ios = v.place_ios;
     o.routability_end_overflow = float("-routability_check_overflow", o.routability_end_overflow)?;
     o.routability_snapshot_overflow = float("-routability_snapshot_overflow", o.routability_snapshot_overflow)?;
     // `-routability_driven`, unless `skipIo()` turned it off
@@ -214,12 +219,20 @@ fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) ->
     Ok(o)
 }
 
+pub use crate::nesterov::IoWrite;
+
+/// `checkPlaceIosSupported`: `-place_ios` needs a rectangular die (GPL-0173).
+fn check_place_ios_supported(log: &mut Log, d: &Design, v: &Vars) -> Res<()> {
+    if v.place_ios && d.io.die_points > 5 {
+        return log.error("GPL", 173, "Concurrent IO placement does not support non-rectangular die. Please drop -place_ios or use a rectangular die.");
+    }
+    Ok(())
+}
+
 /// `Replace::doInitialPlace`, to the placer's construction.
 fn do_initial_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, skip_nesterov: bool) -> Res<Outcome> {
     check_has_core_rows(log, d)?;
-    if v.place_ios {
-        return refuse("-place_ios (checkPlaceIosSupported: the die polygon) is not modelled");
-    }
+    check_place_ios_supported(log, d, v)?;
     let mut common = placer_base::placer_base_common(log, d, v)?;
     let mut bases = vec![placer_base::placer_base(log, d, &common, None, true)?];
     for region in &d.regions {
@@ -279,9 +292,7 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     locked.max_iter = 300;
     locked.uniform_density = true;
     // doInitialPlace on the placer that exists: no construction, no GPL-0123.
-    if v.place_ios {
-        return refuse("-place_ios (checkPlaceIosSupported: the die polygon) is not modelled");
-    }
+    check_place_ios_supported(log, d, v)?;
     let mut ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
     let mut np = nesterov::init_nesterov_place(log, d, &mut common, &mut ip, &bases, &locked)?;
     let mut iter = nesterov::do_nesterov_place(log, d, &mut np, None)?;
@@ -295,7 +306,7 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
         iter = nesterov::continue_nesterov_place(log, d, &mut np, o.overflow, o.max_iter, iter + 1)?;
     }
     let locations = nesterov::placed_locations(&common, &np);
-    Ok(Outcome::Placed(common, bases, locations, iter))
+    Ok(Outcome::Placed(common, bases, locations, iter, Vec::new()))
 }
 
 /// `checkHasCoreRows` (`dbHasCoreRows`: a row whose site is not a PAD site).

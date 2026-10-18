@@ -14,6 +14,7 @@ pub mod bicgstab;
 #[cfg(feature = "cli")]
 pub mod db_router;
 pub mod initial_place;
+pub mod io_pins;
 pub mod ld;
 pub mod log;
 pub mod nesterov;

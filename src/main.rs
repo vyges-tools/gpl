@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use vyges_gpl::log::{refuse, Log, Res, Stop};
-use vyges_gpl::placer_base::{Blockage, DbInst, DbNet, Design, Group, Port, Rect, Region, Term};
+use vyges_gpl::placer_base::{Blockage, DbInst, DbNet, Design, Group, IoPort, Port, Rect, Region, Term};
 use vyges_gpl::run::Outcome;
 use vyges_opendb::Db;
 
@@ -21,15 +21,23 @@ fn e(err: vyges_opendb::Error) -> Stop {
 
 /// `updateDbGCells` then `reportHpwlMetric`: each instance written where the placer has it, then
 /// GPL-1018.
-fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i32, i32)]) -> Result<(), String> {
+fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i32, i32)], io: &[vyges_gpl::run::IoWrite]) -> Result<(), String> {
     use vyges_gpl::route_base::Router;
-    let mut r = vyges_gpl::db_router::DbRouter::new(db);
     let stop = |s: Stop| match s {
         Stop::Refused(m) => m,
         Stop::Error { tool, id } => format!("{tool}-{id:04}"),
     };
-    r.write_locations(log, locations).map_err(stop)?;
-    r.report_hpwl(log).map_err(stop)
+    vyges_gpl::db_router::DbRouter::new(db).write_locations(log, locations).map_err(stop)?;
+    // `updateDbIoPins`: every pin of the port destroyed, one PLACED pin at the solved centre
+    for (port, layer, rect) in io {
+        db.bterm_clear_unfixed_bpins(port).map_err(|e| format!("{port}: {e}"))?;
+        if db.num_bterm_get_b_pins(port) != 0 {
+            return Err(format!("{port}: a FIXED pin on a port concurrent IO placement moves is not modelled"));
+        }
+        let k = db.create_bterm_pin(port, layer, *rect).map_err(|e| format!("{port}: {e}"))?;
+        db.bpin_set_placement_status(port, k, "PLACED").map_err(|e| format!("{port}: {e}"))?;
+    }
+    vyges_gpl::db_router::DbRouter::new(db).report_hpwl(log).map_err(stop)
 }
 
 /// The design as `PlacerBaseCommon` / `PlacerBase` read it, in the block's own orders.
@@ -133,7 +141,8 @@ fn design(db: &Db) -> Res<Design> {
             .into_iter()
             .map(|b| {
                 let r = Rect { lx: db.bterm_get_b_box_x_min(&b), ly: db.bterm_get_b_box_y_min(&b), ux: db.bterm_get_b_box_x_max(&b), uy: db.bterm_get_b_box_y_max(&b) };
-                Port { bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), name: b }
+                let fixed = matches!(db.bterm_get_first_pin_placement_status(&b).as_str(), "LOCKED" | "FIRM" | "COVER");
+                Port { bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), name: b, fixed }
             })
             .collect();
         d.nets.push(DbNet { signal_or_clock: sig == "SIGNAL" || sig == "CLOCK", iterms, bterms, name });
@@ -146,7 +155,42 @@ fn design(db: &Db) -> Res<Design> {
         });
         d.blockages.push(Blockage { bbox: Rect { lx, ly, ux, uy }, inst, max_density: db.blockage_get_max_density(k) });
     }
+    read_io(db, &mut d)?;
     Ok(d)
+}
+
+/// What `-place_ios` reads: every block terminal in block order, the pin blockages, the
+/// top-layer pin grid and the first horizontal / vertical routing layers.
+fn read_io(db: &Db, d: &mut Design) -> Res<()> {
+    let net_ix: HashMap<String, usize> = d.nets.iter().enumerate().map(|(i, n)| (n.name.clone(), i)).collect();
+    for b in db.bterm_names() {
+        let r = Rect { lx: db.bterm_get_b_box_x_min(&b), ly: db.bterm_get_b_box_y_min(&b), ux: db.bterm_get_b_box_x_max(&b), uy: db.bterm_get_b_box_y_max(&b) };
+        let status = db.bterm_get_first_pin_placement_status(&b);
+        let fixed = matches!(status.as_str(), "LOCKED" | "FIRM" | "COVER");
+        let placed = fixed || status == "PLACED";
+        let net = net_ix.get(&db.bterm_net(&b)).copied();
+        let mirror = db.bterm_has_mirrored_b_term(&b).then(|| db.bterm_get_mirrored_b_term(&b));
+        let constraint = db.bterm_constraint_region(&b).map_err(e)?;
+        d.ports.push(IoPort { name: b, net, bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), fixed, placed, constraint, mirror });
+    }
+    d.io.blocked = db.blocked_regions_for_pins().map_err(e)?;
+    d.io.top_grid = db.bterm_top_layer_grid().map_err(e)?.map(|g| {
+        let w = db.layer_get_width(&g.layer) as i32;
+        (g.layer, g.pin_width, g.pin_height, w)
+    });
+    for (layer, dir) in db.layers_with_direction().map_err(e)? {
+        if db.layer_get_routing_level(&layer) == 0 {
+            continue;
+        }
+        let w = db.layer_get_width(&layer) as i32;
+        if dir == "HORIZONTAL" && d.io.hor.is_none() {
+            d.io.hor = Some((layer, w));
+        } else if dir == "VERTICAL" && d.io.ver.is_none() {
+            d.io.ver = Some((layer, w));
+        }
+    }
+    d.io.die_points = db.die_area_polygon().map_err(e)?.len();
+    Ok(())
 }
 
 /// `utl::physicalCoreCount`: distinct (package, core) pairs over the CPUs this process may run on
@@ -277,12 +321,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 return Ok(finish(log, None, extra));
             }
-            Ok(Some(Outcome::Placed(c, bases, locations, iter))) => {
+            Ok(Some(Outcome::Placed(c, bases, locations, iter, io))) => {
                 let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins, "nesterov_iterations": iter,
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 // `updateDbGCells`: each placed instance at its location, PLACED.
                 let db = db.as_mut().expect("read before global_placement");
-                update_db_and_report_hpwl(db, &mut log, &locations)?;
+                update_db_and_report_hpwl(db, &mut log, &locations, &io)?;
                 if let Some(path) = job["write_def"].as_str() {
                     db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
                 }
@@ -369,7 +413,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of placed, vacuous, refused or error. placed means the command ran to the end: the initial placement (and, unless -skip_nesterov_place, the Nesterov placement to the target overflow) written to the database. The declared assertion passes on placed only. Exit status is 0 for placed, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement, placement clusters and routability-driven placement (RUDY or the global router: cell inflation, filler removal, net reweighting, the revert to the best pass), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -virtual_cts, -enable_routing_congestion, -place_ios."
+    "Modelled: the placer's construction, the initial placement and the Nesterov placement (fillers, the pre-placement perturbation, the bin grid, the DCT density field, the weighted-average wirelength gradient, the accelerated descent with back-tracking, the divergence revert) over the top level and every region group, incremental placement, placement clusters routability-driven placement (RUDY or the global router: cell inflation, filler removal, net reweighting, the revert to the best pass) and concurrent IO placement (-place_ios), each bit-exact against the reference: every progress row and every iteration's state. Refused rather than guessed: -timing_driven, -virtual_cts, -enable_routing_congestion."
   ],
   "invocation": {
     "args_template": ["global_placement", "{job}"],

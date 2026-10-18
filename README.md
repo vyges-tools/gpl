@@ -55,9 +55,12 @@ and a `status`:
   congested tiles inflated within the inflation budget, fillers removed for the area, the
   nets feeding those tiles reweighted, and the placement re-run from the snapshot — until the
   congestion meets the target, stops improving or the budget is spent, when the best pass is
-  restored.
+  restored;
+- concurrent IO placement (`-place_ios`): the movable ports placed with the cells, each held to
+  its legal locus on the die perimeter (excluded regions removed, its own constraint region,
+  its mirror partner's reflection) or inside its top-layer box, then written as pins.
 
-Refused rather than guessed: `-timing_driven`, `-virtual_cts`, `-place_ios`.
+Refused rather than guessed: `-timing_driven`, `-virtual_cts`.
 
 ## Build
 

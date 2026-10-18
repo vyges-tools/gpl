@@ -26,6 +26,7 @@ use crate::normal::{normal, Mt19937};
 use crate::ooura;
 use crate::placer_base::{Base, Common, Design};
 use crate::initial_place::Ip;
+use crate::io_pins::{self, Die, Seg};
 use crate::route_base::{RouteBase, RouteVars, Router};
 
 /// `PlaceOptions` as the plain Nesterov mode reads them.
@@ -50,6 +51,8 @@ pub struct Opts {
     /// `routability_end_overflow` (`-routability_check_overflow`).
     pub routability_end_overflow: f32,
     pub routability_snapshot_overflow: f32,
+    /// `placeIosMode` (`-place_ios`): the movable ports placed with the cells.
+    pub place_ios: bool,
 }
 
 impl Default for Opts {
@@ -72,6 +75,7 @@ impl Default for Opts {
             routability: None,
             routability_end_overflow: 0.3,
             routability_snapshot_overflow: 0.6,
+            place_ios: false,
         }
     }
 }
@@ -115,6 +119,8 @@ pub struct GCell {
     /// A placement cluster's instances, in its order (`inst` is the first); empty for a cell of
     /// one instance or a filler.
     pub members: Vec<usize>,
+    /// An IO pin cell (`-place_ios`): its index in the region's [`IoState`].
+    pub io: Option<usize>,
 }
 
 impl GCell {
@@ -140,6 +146,10 @@ impl GCell {
     }
     fn d_dy(&self) -> i32 {
         self.duy - self.dly
+    }
+    /// `isFiller`: neither an instance nor an IO pin.
+    fn is_filler(&self) -> bool {
+        self.inst.is_none() && self.io.is_none()
     }
     fn is_instance(&self) -> bool {
         self.inst.is_some()
@@ -296,16 +306,33 @@ pub fn fast_exp(x: f32) -> f32 {
 
 /// `getDistance` (no IO pins): a float sum of squared differences in cell order, then
 /// `sqrt(sum / (2.0 · n))` in double, returned as float.
+#[cfg(test)]
 fn distance(a: &[FloatPoint], b: &[FloatPoint]) -> f32 {
+    distance_skip(a, b, &[])
+}
+
+/// `getDistance` with a skip list (the IO pin cells, which only slide along the perimeter): the
+/// skipped positions leave the sum and the count.
+fn distance_skip(a: &[FloatPoint], b: &[FloatPoint], skip: &[usize]) -> f32 {
+    let mut skip = skip.to_vec();
+    skip.sort_unstable();
+    let mut next = 0;
     let mut sum = 0.0f32;
     for i in 0..a.len() {
+        if next < skip.len() && skip[next] == i {
+            while next < skip.len() && skip[next] == i {
+                next += 1;
+            }
+            continue;
+        }
         sum += (a[i].x - b[i].x) * (a[i].x - b[i].x);
         sum += (a[i].y - b[i].y) * (a[i].y - b[i].y);
     }
-    if a.is_empty() {
+    let n = a.len() - skip.len();
+    if n == 0 {
         return 0.0;
     }
-    (f64::from(sum) / (2.0 * a.len() as f64)).sqrt() as f32
+    (f64::from(sum) / (2.0 * n as f64)).sqrt() as f32
 }
 
 extern "C" {
@@ -439,6 +466,8 @@ pub struct Nb {
     dbu: i32,
     /// `removed_fillers_`: the fillers routability took out, with their state, in removal order.
     removed_fillers: Vec<RemovedFiller>,
+    /// The region's IO pin cells (`-place_ios`, the top level only).
+    io: Option<IoState>,
     max_phi_coef: f32,
     max_phi_coef_changed: bool,
     cur_slp: Vec<FloatPoint>,
@@ -508,6 +537,11 @@ impl Nb {
         [&mut self.snapshot, &mut self.snapshot_slp, &mut self.snapshot_slp_sum, &mut self.snapshot_prev_slp_sum]
     }
 
+    /// The positions `getDistance` skips: the IO pin cells.
+    fn io_skip(&self) -> Vec<usize> {
+        self.io.as_ref().map(|io| io.pos.clone()).unwrap_or_default()
+    }
+
     /// `destroyFillerGCell`: the cell at `i` swapped with the last and popped — the cell list and
     /// every per-cell vector alike (`swapAndPopParallelVectors`).
     fn swap_pop(&mut self, i: usize) -> RemovedFiller {
@@ -560,6 +594,7 @@ impl Nb {
             fixed: vec![],
             dbu: 0,
             removed_fillers: vec![],
+            io: None,
             white_space_area: 0,
             std_insts_area: base.std_insts_area,
             macro_insts_area: base.macro_insts_area,
@@ -649,6 +684,8 @@ pub struct Nesterov {
     routability_need: bool,
     /// `minRcCellSize_`: each standard instance cell's size at the minimum congestion so far.
     min_rc_cell_size: Vec<(i32, i32)>,
+    /// `-place_ios`: each port's pin (`dbToNb(bterm)`), by port name.
+    port_gpin: std::collections::HashMap<String, usize>,
 }
 
 /// A float point vector's FNV-1a (x then y, each little-endian) — the reference probe's.
@@ -772,7 +809,17 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         diverge: None,
         routability_need: true,
         min_rc_cell_size: vec![],
+        port_gpin: std::collections::HashMap::new(),
     };
+    if o.place_ios {
+        // each net's port pins follow its terminals in the net's order
+        for (n, &(k, _)) in c.nets.iter().enumerate() {
+            let ports = ip.net_pins[n].iter().copied().filter(|&p| ip.pins[p].port);
+            for (p, port) in ports.zip(&d.nets[k].bterms) {
+                np.port_gpin.insert(port.name.clone(), p);
+            }
+        }
+    }
     for base in bases {
         let nb = nesterov_base(log, d, c, ip, base, &inst_cell, &mut np)?;
         np.nbs.push(nb);
@@ -799,11 +846,313 @@ fn nesterov_base(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &
         nb.cells.push(np.gcells.len());
         np.gcells.push(f);
     }
+    // `initIoPinGCells`: the top level's movable ports, after the fillers
+    if np.o.place_ios && base.group.is_none() {
+        nb.io = Some(init_io_pin_gcells(log, d, np, &mut nb)?);
+    }
     init_bins(log, d, c, base, &mut nb, &np.o);
     nb.fft = Fft::new(nb.bg.cnt_x, nb.bg.cnt_y, nb.bg.size_x as f32, nb.bg.size_y as f32);
     update_density_size(&mut np.gcells, &nb);
     probe_init(log, &np.gcells, &nb);
     Ok(nb)
+}
+
+/// A region's IO pin cells (`-place_ios`): per IO index its port, its cell and that cell's place in
+/// the region, its `up:` box (when it has one) or its edge locus, its mirror pairing, and where its
+/// pin was last written.
+#[derive(Debug, Clone)]
+pub struct IoState {
+    die: Die,
+    names: Vec<String>,
+    cells: Vec<usize>,
+    pos: Vec<usize>,
+    boxes: Vec<Option<(i32, i32, i32, i32)>>,
+    segs: Vec<Vec<Seg>>,
+    free: Vec<Seg>,
+    follower: Vec<Option<usize>>,
+    is_follower: Vec<bool>,
+    pairs: Vec<(usize, usize)>,
+    last: Vec<(i32, i32)>,
+    hor: (String, i32),
+    ver: (String, i32),
+    top: Option<(String, i32, i32, i32)>,
+}
+
+impl IoState {
+    /// `ioLocus`: the pin's constraint segments, else the free perimeter.
+    fn locus(&self, i: usize) -> &[Seg] {
+        if self.segs[i].is_empty() {
+            &self.free
+        } else {
+            &self.segs[i]
+        }
+    }
+
+    /// `projectIoPin`: an `up:` box clamps (`std::clamp`); otherwise the nearest point of the
+    /// locus — `(0, 0)` when it is empty, as the reference's default `FloatPoint`.
+    fn project(&self, i: usize, x: f32, y: f32) -> (f32, f32) {
+        if let Some((x0, y0, x1, y1)) = self.boxes[i] {
+            let clamp = |v: f32, lo: f32, hi: f32| if v < lo { lo } else if hi < v { hi } else { v };
+            return (clamp(x, x0 as f32, x1 as f32), clamp(y, y0 as f32, y1 as f32));
+        }
+        io_pins::nearest(&self.die, self.locus(i), x, y).map_or((0.0, 0.0), |(_, p)| p)
+    }
+
+    /// `ioEdgeOnLocus`: the edge of the locus segment nearest an integer point.
+    fn edge_on_locus(&self, i: usize, cx: i32, cy: i32) -> io_pins::Edge {
+        io_pins::nearest(&self.die, self.locus(i), cx as f32, cy as f32).expect("a pin with a locus").0.edge
+    }
+
+    /// `mirrorOfIoPin`: the point reflected across the die on the axis of the master's own edge
+    /// (the edge read at the point truncated to integers).
+    fn mirror_of(&self, master: usize, p: (f32, f32)) -> (f32, f32) {
+        let mut r = p;
+        match self.edge_on_locus(master, p.0 as i32, p.1 as i32) {
+            io_pins::Edge::Left => r.0 = self.die.ux,
+            io_pins::Edge::Right => r.0 = self.die.lx,
+            io_pins::Edge::Bottom => r.1 = self.die.uy,
+            io_pins::Edge::Top => r.1 = self.die.ly,
+        }
+        r
+    }
+
+    /// `applyMirrorConstraints`: each follower the reflection of its master, in pair order.
+    fn apply_mirror(&self, coords: &mut [FloatPoint]) {
+        for &(m, f) in &self.pairs {
+            let p = self.mirror_of(m, (coords[self.pos[m]].x, coords[self.pos[m]].y));
+            coords[self.pos[f]] = FloatPoint::new(p.0, p.1);
+        }
+    }
+}
+
+/// `GCell::setCenterLocation` then `setDensityCenterLocation` for an IO cell, its pin moved with
+/// it (offset 0).
+fn set_io_center(np: &mut Nesterov, gi: usize, cx: i32, cy: i32) {
+    let g = &mut np.gcells[gi];
+    let (hx, hy) = (g.dx() / 2, g.dy() / 2);
+    g.lx = cx - hx;
+    g.ly = cy - hy;
+    g.ux = cx + hx;
+    g.uy = cy + hy;
+    let (hdx, hdy) = (g.d_dx() / 2, g.d_dy() / 2);
+    g.dlx = cx - hdx;
+    g.dly = cy - hdy;
+    g.dux = cx + hdx;
+    g.duy = cy + hdy;
+    let (dcx, dcy) = (g.d_cx(), g.d_cy());
+    for k in 0..np.gcells[gi].pins.len() {
+        let p = np.gcells[gi].pins[k];
+        np.gpins[p].cx = dcx + np.gpins[p].off_x;
+        np.gpins[p].cy = dcy + np.gpins[p].off_y;
+    }
+}
+
+/// `initIoPinGCells`: the dummy layers (GPL-0174); every port with a pin that is not fixed
+/// (block order; GPL-0184 counts the placed ones) as a cell at the die centre, a port's own box
+/// size or a micron square; the `up:` boxes (and their grid, GPL-0183); the cells after the
+/// region's; mirror pairs between movable ports without boxes, each port in at most one; the
+/// constraints; each non-follower seeded at its box centre or its net's instance centroid,
+/// projected, then each follower at its master's reflection (GPL-0171).
+fn init_io_pin_gcells(log: &mut Log, d: &Design, np: &mut Nesterov, nb: &mut Nb) -> Res<IoState> {
+    let (Some(hor), Some(ver)) = (d.io.hor.clone(), d.io.ver.clone()) else {
+        return log.error("GPL", 174, "Concurrent IO placement: the design has no horizontal and vertical routing layers, so there is nowhere to write the solved IO pin locations. Read a technology with routing layers, or drop -place_ios.");
+    };
+    let die = Die { lx: d.die.lx as f32, ly: d.die.ly as f32, ux: d.die.ux as f32, uy: d.die.uy as f32 };
+    let (die_cx, die_cy) = ((d.die.lx + d.die.ux) / 2, (d.die.ly + d.die.uy) / 2);
+    let mut movable = Vec::new();
+    let mut already = 0;
+    for (pi, p) in d.ports.iter().enumerate() {
+        let Some(&gp) = np.port_gpin.get(&p.name) else { continue };
+        if p.fixed {
+            continue;
+        }
+        if p.placed {
+            already += 1;
+        }
+        movable.push((pi, gp));
+    }
+    if already > 0 {
+        log.warn("GPL", 184, format!("Concurrent IO placement moves {already} already placed IO pins. Set them FIXED to keep their positions."));
+    }
+    let n = movable.len();
+    let mut io = IoState {
+        die,
+        names: movable.iter().map(|&(pi, _)| d.ports[pi].name.clone()).collect(),
+        cells: Vec::with_capacity(n),
+        pos: Vec::with_capacity(n),
+        boxes: vec![None; n],
+        segs: vec![Vec::new(); n],
+        free: Vec::new(),
+        follower: vec![None; n],
+        is_follower: vec![false; n],
+        pairs: Vec::new(),
+        last: vec![(i32::MIN, i32::MIN); n],
+        hor,
+        ver,
+        top: None,
+    };
+    for (i, &(pi, _)) in movable.iter().enumerate() {
+        if let Some(c) = d.ports[pi].constraint {
+            if c.0 != c.2 && c.1 != c.3 {
+                io.boxes[i] = Some(c);
+            }
+        }
+    }
+    if io.boxes.iter().any(Option::is_some) {
+        match &d.io.top_grid {
+            Some(g) => io.top = Some(g.clone()),
+            None => return log.error("GPL", 183, "Concurrent IO placement: IO pins have a top-layer (up:) constraint region but no pin placement grid exists. Call define_pin_shape_pattern first, or drop -place_ios."),
+        }
+    }
+    let mut index_of = std::collections::HashMap::new();
+    for (i, &(pi, gp)) in movable.iter().enumerate() {
+        let p = &d.ports[pi];
+        let (dx, dy) = match p.bbox {
+            None => (d.dbu, d.dbu),
+            Some(b) => (b.dx().max(1), b.dy().max(1)),
+        };
+        let gi = np.gcells.len();
+        let mut g = GCell::filler(die_cx, die_cy, dx, dy);
+        g.io = Some(i);
+        g.pins = vec![gp];
+        np.gcells.push(g);
+        np.gpins[gp].gcell = Some(gi);
+        nb.cells.push(gi);
+        io.cells.push(gi);
+        io.pos.push(nb.cells.len() - 1);
+        index_of.insert(p.name.clone(), i);
+    }
+    for (i, &(pi, _)) in movable.iter().enumerate() {
+        let Some(partner_name) = &d.ports[pi].mirror else { continue };
+        let Some(&partner) = index_of.get(partner_name) else { continue };
+        if io.boxes[i].is_some() || io.boxes[partner].is_some() {
+            continue;
+        }
+        if io.follower[i].is_some() || io.is_follower[i] || io.follower[partner].is_some() || io.is_follower[partner] {
+            continue;
+        }
+        io.follower[i] = Some(partner);
+        io.is_follower[partner] = true;
+        io.pairs.push((i, partner));
+    }
+    init_io_constraints(log, d, &movable, &mut io)?;
+    for i in 0..n {
+        if io.is_follower[i] {
+            continue;
+        }
+        let p = &d.ports[movable[i].0];
+        let (x, y) = match p.bbox {
+            Some(b) => (((b.lx + b.ux) / 2) as f32, ((b.ly + b.uy) / 2) as f32),
+            None => {
+                let net = np.pin_net[movable[i].1];
+                let (mut sx, mut sy, mut cnt) = (0i64, 0i64, 0i64);
+                for &q in &np.gnets[net].pins {
+                    if let Some(gc) = np.gpins[q].gcell {
+                        let g = &np.gcells[gc];
+                        if g.is_instance() {
+                            sx += i64::from((g.lx + g.ux) / 2);
+                            sy += i64::from((g.ly + g.uy) / 2);
+                            cnt += 1;
+                        }
+                    }
+                }
+                if cnt == 0 {
+                    (die_cx as f32, die_cy as f32)
+                } else {
+                    (sx as f32 / cnt as f32, sy as f32 / cnt as f32)
+                }
+            }
+        };
+        let (px, py) = io.project(i, x, y);
+        set_io_center(np, io.cells[i], px as i32, py as i32);
+    }
+    for k in 0..io.pairs.len() {
+        let (m, f) = io.pairs[k];
+        let g = &np.gcells[io.cells[m]];
+        let c = (((g.lx + g.ux) / 2) as f32, ((g.ly + g.uy) / 2) as f32);
+        let p = io.mirror_of(m, c);
+        set_io_center(np, io.cells[f], p.0 as i32, p.1 as i32);
+    }
+    log.info("GPL", 171, format!("Concurrent IO placement: {} movable IO pins seeded ({} mirror pairs).", n, io.pairs.len()));
+    Ok(io)
+}
+
+/// `initIoConstraints`: the free perimeter (GPL-0180 when it is empty and a pin needs it); each
+/// edge-constrained pin's interval within it (GPL-0175 when none is left); each mirror pair's
+/// master locus narrowed to what reflects onto the follower's, the follower's its reflection
+/// (GPL-0178); GPL-0177 when anything constrains.
+fn init_io_constraints(log: &mut Log, d: &Design, movable: &[(usize, usize)], io: &mut IoState) -> Res<()> {
+    if movable.is_empty() {
+        return Ok(());
+    }
+    io.free = io_pins::free_segments(&io.die, &d.io.blocked);
+    let any_perimeter = io.boxes.iter().any(Option::is_none);
+    if io.free.is_empty() && any_perimeter {
+        return log.error("GPL", 180, "Concurrent IO placement: the excluded IO pin regions cover the whole die perimeter, so no perimeter IO pin has a legal position.");
+    }
+    let mut constrained = 0;
+    for (i, &(pi, _)) in movable.iter().enumerate() {
+        if io.boxes[i].is_some() {
+            continue;
+        }
+        let Some(cr) = d.ports[pi].constraint else { continue };
+        if let Some(seg) = io_pins::rect_to_seg(&io.die, cr) {
+            io.segs[i] = io_pins::intersect_segs(&[seg], &io.free);
+            if io.segs[i].is_empty() {
+                return log.error("GPL", 175, format!("Concurrent IO placement: the constraint region of pin {} is entirely excluded from IO pin placement, so the pin has no legal position.", d.ports[pi].name));
+            }
+            constrained += 1;
+        }
+    }
+    for k in 0..io.pairs.len() {
+        let (m, f) = io.pairs[k];
+        let both = io_pins::intersect_segs(io.locus(m), &io_pins::mirror_segs(io.locus(f)));
+        if both.is_empty() {
+            let (mn, fname) = (&io.names[m], &io.names[f]);
+            return log.error("GPL", 178, format!("Concurrent IO placement: mirrored pins {mn} and {fname} cannot both be placed legally - no position on {mn}'s locus reflects onto {fname}'s."));
+        }
+        io.segs[f] = io_pins::mirror_segs(&both);
+        io.segs[m] = both;
+    }
+    if constrained > 0 || !d.io.blocked.is_empty() {
+        log.info("GPL", 177, format!("Concurrent IO placement: {} pins region-constrained, {} free perimeter segments after blocked-region removal.", constrained, io.free.len()));
+    }
+    Ok(())
+}
+
+/// An IO pin to rebuild: `(port, layer, box)`.
+pub type IoWrite = (String, String, (i32, i32, i32, i32));
+
+/// `updateDbIoPins`: each IO pin whose cell moved since its last write — at the cell's density
+/// centre, on the `up:` grid's layer with its pin size, or on the routing layer a pin on that edge
+/// takes (a horizontal edge the vertical layer) at the cell's half size, never under half the
+/// layer's width. `(port, layer, box)` per pin to rebuild.
+pub fn io_pin_writes(np: &mut Nesterov) -> Vec<IoWrite> {
+    let mut out = Vec::new();
+    let gcells = &np.gcells;
+    for nb in np.nbs.iter_mut() {
+        let Some(io) = nb.io.as_mut() else { continue };
+        for i in 0..io.cells.len() {
+            let g = &gcells[io.cells[i]];
+            let (cx, cy) = (g.d_cx(), g.d_cy());
+            if io.last[i] == (cx, cy) {
+                continue;
+            }
+            let (layer, width, mut hw, mut hh) = if io.boxes[i].is_some() {
+                let (l, pw, ph, w) = io.top.clone().expect("a box-constrained pin has the grid");
+                (l, w, pw / 2, ph / 2)
+            } else {
+                let (l, w) = if io.edge_on_locus(i, cx, cy).horizontal() { io.ver.clone() } else { io.hor.clone() };
+                (l, w, g.dx() / 2, g.dy() / 2)
+            };
+            let min_half = width / 2;
+            hw = hw.max(min_half);
+            hh = hh.max(min_half);
+            out.push((io.names[i].clone(), layer, (cx - hw, cy - hh, cx + hw, cy + hh)));
+            io.last[i] = (cx, cy);
+        }
+    }
+    out
 }
 
 /// `GCell::updateLocations` for a cluster: centred on its instances' bounding box (integer
@@ -1390,7 +1739,7 @@ impl Nesterov {
                         bin.inst_placed_unscaled += a as i64;
                     }
                 }
-            } else {
+            } else if g.is_filler() {
                 for y in y0..y1 {
                     for x in x0..x1 {
                         let bin = &mut bg.bins[(y * bg.cnt_x + x) as usize];
@@ -1612,8 +1961,37 @@ impl Nesterov {
             den[i] = self.density_gradient(b, i);
         }
         let p = self.nbs[b].density_penalty;
+        // the followers' wirelength gradients, before they are zeroed
+        let follower_wl: Vec<(usize, FloatPoint)> = self.nbs[b].io.as_ref().map(|io| io.pairs.iter().map(|&(_, f)| (f, wl[io.pos[f]])).collect()).unwrap_or_default();
         for i in 0..n {
             let g = &self.gcells[self.nbs[b].cells[i]];
+            if let (Some(j), Some(io)) = (g.io, self.nbs[b].io.as_ref()) {
+                if io.is_follower[j] {
+                    // no freedom of its own: its master carries it
+                    wl[i] = FloatPoint::default();
+                    den[i] = FloatPoint::default();
+                    sum[i] = FloatPoint::default();
+                    continue;
+                }
+                // wirelength only
+                den[i] = FloatPoint::default();
+                sum[i] = wl[i];
+                let mut pre = FloatPoint::new((g.pins.len() as f32).max(MIN_PRECONDITIONER), (g.pins.len() as f32).max(MIN_PRECONDITIONER));
+                if let Some(f) = io.follower[j] {
+                    let fg = follower_wl.iter().find(|&&(k, _)| k == f).map(|&(_, v)| v).unwrap_or_default();
+                    let fp = (self.gcells[io.cells[f]].pins.len() as f32).max(MIN_PRECONDITIONER);
+                    if io.edge_on_locus(j, g.d_cx(), g.d_cy()).horizontal() {
+                        sum[i].x += fg.x;
+                        pre.x += fp;
+                    } else {
+                        sum[i].y += fg.y;
+                        pre.y += fp;
+                    }
+                }
+                sum[i].x /= pre.x;
+                sum[i].y /= pre.y;
+                continue;
+            }
             sum[i].x = wl[i].x + p * den[i].x;
             sum[i].y = wl[i].y + p * den[i].y;
             let wl_pre = g.pins.len() as f32;
@@ -1703,7 +2081,10 @@ impl Nesterov {
             }
         }
         for i in 0..n {
-            self.update_density_coordi_layout_inside(b, i);
+            // an IO pin has its own locus
+            if self.gcells[self.nbs[b].cells[i]].io.is_none() {
+                self.update_density_coordi_layout_inside(b, i);
+            }
             let g = &self.gcells[self.nbs[b].cells[i]];
             let p = FloatPoint::new(g.d_cx() as f32, g.d_cy() as f32);
             let nb = &mut self.nbs[b];
@@ -1735,8 +2116,18 @@ impl Nesterov {
             }
             let px = self.nbs[b].cur_slp[i].x - c * self.nbs[b].cur_slp_sum[i].x;
             let py = self.nbs[b].cur_slp[i].y - c * self.nbs[b].cur_slp_sum[i].y;
-            let q = FloatPoint::new(self.inside_x(b, i, px), self.inside_y(b, i, py));
+            let q = match (self.gcells[self.nbs[b].cells[i]].io, self.nbs[b].io.as_ref()) {
+                (Some(j), Some(io)) => {
+                    let (x, y) = io.project(j, px, py);
+                    FloatPoint::new(x, y)
+                }
+                _ => FloatPoint::new(self.inside_x(b, i, px), self.inside_y(b, i, py)),
+            };
             self.nbs[b].prev_slp[i] = q;
+        }
+        if let Some(io) = self.nbs[b].io.take() {
+            io.apply_mirror(&mut self.nbs[b].prev_slp);
+            self.nbs[b].io = Some(io);
         }
     }
 
@@ -1756,8 +2147,9 @@ impl Nesterov {
         let nia = nesterov_insts_area(nb) as f32;
         nb.sum_overflow = nb.bg.overflow as f32 / nia;
         nb.sum_overflow_unscaled = nb.bg.overflow_unscaled as f32 / nia;
-        nb.coordi_distance = distance(&nb.prev_slp, &nb.cur_slp);
-        let grad = distance(&nb.prev_slp_sum, &nb.cur_slp_sum);
+        let skip = nb.io_skip();
+        nb.coordi_distance = distance_skip(&nb.prev_slp, &nb.cur_slp, &skip);
+        let grad = distance_skip(&nb.prev_slp_sum, &nb.cur_slp_sum, &skip);
         nb.step_length = nb.coordi_distance / grad;
         nb.step_length
     }
@@ -1870,10 +2262,21 @@ impl Nesterov {
             let ny = nb.cur_slp[k].y + s * nb.cur_slp_sum[k].y;
             let sx = nx + coeff * (nx - nb.cur[k].x);
             let sy = ny + coeff * (ny - nb.cur[k].y);
-            let next = FloatPoint::new(self.inside_x(b, k, nx), self.inside_y(b, k, ny));
-            let next_slp = FloatPoint::new(self.inside_x(b, k, sx), self.inside_y(b, k, sy));
+            let (next, next_slp) = match (self.gcells[self.nbs[b].cells[k]].io, self.nbs[b].io.as_ref()) {
+                // onto the pin's locus instead of inside the core
+                (Some(j), Some(io)) => {
+                    let (a, b2) = (io.project(j, nx, ny), io.project(j, sx, sy));
+                    (FloatPoint::new(a.0, a.1), FloatPoint::new(b2.0, b2.1))
+                }
+                _ => (FloatPoint::new(self.inside_x(b, k, nx), self.inside_y(b, k, ny)), FloatPoint::new(self.inside_x(b, k, sx), self.inside_y(b, k, sy))),
+            };
             self.nbs[b].next[k] = next;
             self.nbs[b].next_slp[k] = next_slp;
+        }
+        if let Some(io) = self.nbs[b].io.take() {
+            io.apply_mirror(&mut self.nbs[b].next);
+            io.apply_mirror(&mut self.nbs[b].next_slp);
+            self.nbs[b].io = Some(io);
         }
         let ns = self.nbs[b].next_slp.clone();
         self.update_gcell_density_center_location(b, &ns);
@@ -1887,8 +2290,9 @@ impl Nesterov {
         if nb.is_converged {
             return true;
         }
-        nb.coordi_distance = distance(&nb.cur_slp, &nb.next_slp);
-        let grad = distance(&nb.cur_slp_sum, &nb.next_slp_sum);
+        let skip = nb.io_skip();
+        nb.coordi_distance = distance_skip(&nb.cur_slp, &nb.next_slp, &skip);
+        let grad = distance_skip(&nb.cur_slp_sum, &nb.next_slp_sum, &skip);
         let new = nb.coordi_distance / grad;
         if new.is_nan() || new.is_infinite() {
             nb.is_diverged = true;
@@ -2326,7 +2730,7 @@ impl Nesterov {
         let mut i = self.nbs[b].cells.len() as i64 - 1;
         while i >= 0 && removed < max_remove {
             let gi = self.nbs[b].cells[i as usize];
-            if !self.gcells[gi].is_instance() {
+            if self.gcells[gi].is_filler() {
                 let f = self.nbs[b].swap_pop(i as usize);
                 let nb = &mut self.nbs[b];
                 nb.removed_fillers.push(f);
