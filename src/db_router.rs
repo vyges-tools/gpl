@@ -125,18 +125,27 @@ impl Router for DbRouter<'_> {
         Ok(())
     }
 
-    fn find_resize_slacks(&mut self, log: &mut Log, locations: &[(usize, i32, i32)], repair_timing: bool, _tns_end_percent: f32) -> Res<crate::timing_driven::ResizeReport> {
+    fn find_resize_slacks(&mut self, log: &mut Log, locations: &[(usize, i32, i32)], repair_timing: bool, tns_end_percent: f32) -> Res<crate::timing_driven::ResizeReport> {
         use serde_json::{json, Value};
-        if repair_timing {
-            return refuse("-timing_driven_repair_timing (one setup repair pass at the last reweight) is not modelled");
-        }
         let Some(read_design) = self.read_design else { return refuse("timing-driven placement without the design reader") };
         self.write_locations(log, locations)?;
         let mut steps = self.rsz_steps.clone();
         steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-placement"] }));
         steps.push(json!({ "cmd": "repair_design", "args": ["-vyges_resize_slack"] }));
-        // the slacks on the timer the rebuffering left (`findResizeSlacks1` after `fullyRebuffer`)
-        steps.push(json!({ "cmd": "fully_rebuffer", "args": ["NULL", "-vyges_resize_slacks"] }));
+        if repair_timing {
+            // `findResizeSlacks(…, run_repair_timing)`: `fullyRebuffer`, one conservative
+            // `repairSetup` pass (margin 0, one pass, one repair per pass; no pin swap, cloning,
+            // last gasp or VT swaps), the parasitics estimated again, then `findResizeSlacks1`.
+            // The TNS fraction is the placer's float (`percent / 100.0f`).
+            let fraction = f64::from(tns_end_percent / 100.0f32).to_string();
+            steps.push(json!({ "cmd": "fully_rebuffer", "args": ["NULL"] }));
+            steps.push(json!({ "cmd": "repair_timing", "args": ["-setup", "-setup_margin", "0", "-vyges_repair_tns_fraction", fraction, "-max_passes", "1", "-max_iterations", "0", "-max_repairs_per_pass", "1", "-skip_pin_swap", "-skip_gate_cloning", "-skip_last_gasp", "-skip_vt_swap", "-skip_crit_vt_swap"] }));
+            steps.push(json!({ "cmd": "estimate_parasitics", "args": ["-placement"] }));
+            steps.push(json!({ "cmd": "resize_slacks", "args": [] }));
+        } else {
+            // the slacks on the timer the rebuffering left (`findResizeSlacks1` after `fullyRebuffer`)
+            steps.push(json!({ "cmd": "fully_rebuffer", "args": ["NULL", "-vyges_resize_slacks"] }));
+        }
         let mut job = json!({ "steps": steps });
         if let Some(l) = &self.sta_levels {
             job["sta_levels"] = l.clone();
@@ -167,10 +176,14 @@ impl Router for DbRouter<'_> {
                 }
             }
         }
-        if runs.len() < 2 {
+        if !runs.iter().any(|r| r.get("resize_slacks").is_some()) {
             return refuse(format!("the resizer stopped: {}", report["timing_stop"].as_str().unwrap_or("before its slacks")));
         }
         let events = self.db.observer_log_take();
+        // A diagnostic: each call's callbacks in order (`VYGES_GPL_EVENTS=<file>`, `.N` per call).
+        if let Ok(path) = std::env::var("VYGES_GPL_EVENTS") {
+            let _ = std::fs::write(format!("{path}.{}", self.rsz_calls), events.join("\n") + "\n");
+        }
         self.sta_levels = report.get("sta_levels").cloned();
         let net_ids_after = self.db.net_ids();
         let design = read_design(self.db)?;

@@ -1611,6 +1611,7 @@ fn probe_init(log: &mut Log, gcells: &[GCell], nb: &Nb) {
             hn = fnv(&v.to_le_bytes(), hn);
         }
     }
+    vyg_dump_count();
     log.trace(format!(
         "VYGNB|INIT|{}|{}|{:016x}|{:016x}|{}|{}|{}|{:08x}|{:016x}|{:016x}|{:016x}|{:016x}|{:016x}",
         nb.bg.cnt_x,
@@ -2213,6 +2214,15 @@ impl Nesterov {
     /// A state probe (`vygDump`) of region `b`, in the instrumented reference's format.
     fn probe(&self, log: &mut Log, b: usize, tag: &str, iter: i32, a: f32, bb: f32) {
         let nb = &self.nbs[b];
+        // VYG_NP_CELLS_AT=<n>: at the n-th probe (INIT is the first), every cell's boxes and vectors
+        let n = vyg_dump_count();
+        if std::env::var("VYG_NP_CELLS_AT").ok().and_then(|v| v.parse::<usize>().ok()) == Some(n) {
+            for (i, g) in nb.cells.iter().map(|&gi| &self.gcells[gi]).enumerate() {
+                let v = [nb.prev_slp[i].x, nb.prev_slp[i].y, nb.cur_slp[i].x, nb.cur_slp[i].y, nb.cur_slp_wl[i].x, nb.cur_slp_wl[i].y, nb.cur_slp_den[i].x, nb.cur_slp_den[i].y];
+                let hex: Vec<String> = v.iter().map(|f| format!("{:08x}", f.to_bits())).collect();
+                eprintln!("VYGNBA|{i}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", g.lx, g.ly, g.ux, g.uy, g.dlx, g.dly, g.dux, g.duy, g.pins.len(), hex.join("|"));
+            }
+        }
         if tag == "NPINIT" && std::env::var_os("VYG_NP_CELLS").is_some() {
             for (i, g) in nb.cells.iter().map(|&gi| &self.gcells[gi]).enumerate() {
                 let v = [nb.cur_slp_wl[i].x, nb.cur_slp_wl[i].y, nb.cur_slp_den[i].x, nb.cur_slp_den[i].y, nb.cur_slp_sum[i].x, nb.cur_slp_sum[i].y, nb.prev_slp_wl[i].x, nb.prev_slp_wl[i].y, nb.prev_slp_sum[i].x, nb.prev_slp_sum[i].y];
@@ -2732,6 +2742,7 @@ impl Nesterov {
         let new_ix: HashMap<&str, usize> = new.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
         let old_names: std::collections::HashSet<&str> = old.insts.iter().map(|x| x.name.as_str()).collect();
         let destroyed: std::collections::HashSet<&str> = events.iter().filter_map(|e| e.strip_prefix("inst_destroy|")).collect();
+        let swapped: std::collections::HashSet<&str> = events.iter().filter_map(|e| e.strip_prefix("swap_after|")).filter_map(|e| e.split('|').next()).collect();
         // each instance cell by its instance's name (`db_inst_to_nbc_index_map_`)
         let mut cell_of: HashMap<String, usize> = HashMap::new();
         for (gi, g) in self.gcells.iter().enumerate() {
@@ -2750,7 +2761,7 @@ impl Nesterov {
             match new_ix.get(o.name.as_str()) {
                 None if destroyed.contains(o.name.as_str()) => {}
                 None => return refuse(format!("{}: an instance the resizer removed without a callback is not modelled", o.name)),
-                Some(&n) if new.insts[n].master != o.master => return refuse(format!("{}: an instance the resizer resized is not modelled", o.name)),
+                Some(&n) if new.insts[n].master != o.master && !swapped.contains(o.name.as_str()) => return refuse(format!("{}: an instance the resizer resized is not modelled", o.name)),
                 Some(&n) => i.db = Some(n),
             }
         }
@@ -2833,6 +2844,34 @@ impl Nesterov {
                             }
                         }
                     }
+                }
+                // `nesterovDbCbk::inDbInstSwapMasterAfter` → `NesterovBaseCommon::resizeGCell`:
+                // each instance's padded box from the database (`copyDbLocation`), the cell's boxes
+                // on it (`updateLocations`: one instance, density box = box), the area change on
+                // `delta_area_`. The pins keep their offsets; the regions' coordinates are untouched.
+                ["swap_after", name, ..] => {
+                    let Some(&gi) = cell_of.get(*name) else { continue };
+                    if !self.gcells[gi].members.is_empty() {
+                        return refuse(format!("{name}: a resized placement-cluster member is not modelled"));
+                    }
+                    let Some(k) = self.gcells[gi].inst else { continue };
+                    let Some(db) = c.insts[k].db else { continue };
+                    let di = &new.insts[db];
+                    let prev = i64::from(self.gcells[gi].dx()) * i64::from(self.gcells[gi].dy());
+                    let inst = &mut c.insts[k];
+                    inst.lx = di.bbox.lx;
+                    inst.ly = di.bbox.ly;
+                    inst.ux = di.bbox.lx + di.bbox.dx();
+                    inst.uy = di.bbox.ly + di.bbox.dy();
+                    if inst.is_place_instance() {
+                        inst.lx -= pad_left * c.site_x;
+                        inst.ux += pad_right * c.site_x;
+                    }
+                    let (lx, ly, ux, uy) = (inst.lx, inst.ly, inst.ux, inst.uy);
+                    let g = &mut self.gcells[gi];
+                    (g.lx, g.ly, g.ux, g.uy) = (lx, ly, ux, uy);
+                    (g.dlx, g.dly, g.dux, g.duy) = (lx, ly, ux, uy);
+                    out.delta_area += i64::from(g.dx()) * i64::from(g.dy()) - prev;
                 }
                 ["net_create", name, _] => {
                     let Some(id) = event_id(&f) else { return refuse(format!("{name}: a net callback without its id")) };
@@ -3661,6 +3700,12 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         return log.error("GPL", code, msg);
     }
     Ok(iter)
+}
+
+/// The probes' ordinal (the instrumented reference's dump counter), for `VYG_NP_CELLS_AT`.
+fn vyg_dump_count() -> usize {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 #[cfg(test)]
