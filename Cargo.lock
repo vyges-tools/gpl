@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-grt"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "vyges-est",
  "vyges-opendb",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-rsz"
-version = "0.1.41"
+version = "0.1.42"
 dependencies = [
  "flate2",
  "serde_json",
