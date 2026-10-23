@@ -443,7 +443,7 @@ dependencies = [
 [[package]]
 name = "vyges-events"
 version = "0.1.44"
-source = "git+https://github.com/vyges-tools/events.git?branch=main#01165bedc9208abc345044cfc7ae705d2cf75666"
+source = "git+https://github.com/vyges-tools/events.git?branch=main#828293b2ef749ecbeafb936564f2911e3a2e8be2"
 dependencies = [
  "serde",
  "serde_json",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-grt"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "vyges-est",
  "vyges-opendb",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-rsz"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "flate2",
  "serde_json",
