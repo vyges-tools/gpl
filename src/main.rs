@@ -225,7 +225,7 @@ fn run(job: &Value) -> Result<Value, String> {
     // The resizer's session as the job sets it up (timing-driven placement replays it at each
     // reweight): its libraries, corners, RC, dont_use and constraints.
     let mut rsz_steps: Vec<Value> = Vec::new();
-    let mut log = Log::default();
+    let mut log = Log::with_events("vyges-gpl");
     let finish = |log: Log, stop: Option<String>, extra: Value| {
         let (status, reason) = match stop {
             None => ("placed".to_string(), None),
@@ -234,7 +234,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 None => (s, None),
             },
         };
-        let mut v = json!({"tool": "vyges-gpl", "status": status, "reason": reason, "lines": log.lines, "trace": log.trace});
+        let mut v = json!({"tool": "vyges-gpl", "status": status, "reason": reason, "lines": log.lines(), "trace": log.trace});
         if let (Some(o), Value::Object(x)) = (v.as_object_mut(), extra) {
             o.extend(x);
         }
@@ -256,7 +256,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     if tool == "RSZ" {
                         rsz_steps.push(step.clone());
                     }
-                    log.debug.insert((tool.clone(), group.clone()), level);
+                    log.set_debug_level(tool, group, level);
                 }
                 // `placement_cluster`: its names (one list, or several), each found as `get_cells`
                 // finds an exact name (GPL-0095 when none is), GPL-0096; kept for the placer.
@@ -289,7 +289,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     threads.asked = n.parse().map_err(|_| Stop::Refused(format!("set_thread_count {n}: not a count")))?;
                 }
                 "global_placement" => {
-                    log.lines.clear();
+                    log.take_lines();
                     let dbr = db.as_ref().ok_or_else(|| Stop::Refused("global_placement before read_db".into()))?;
                     let mut d = design(dbr)?;
                     d.clusters = clusters.clone();
@@ -488,26 +488,10 @@ fn exit_for(status: &str) -> u8 {
     }
 }
 
-/// The run's lines as structured events (`vyges-events/1.0`): each `[INFO|WARNING|ERROR TOOL-nnnn]
-/// text` line the reference's logger would print under its own code and severity, any other line
-/// (`report` text) as information; a refusal under `GPL-REFUSED`. The JSON report is unchanged.
-fn emit_events(report: &serde_json::Value) {
+/// A refusal as an event (`vyges-events/1.0`) under `GPL-REFUSED`; the run's lines were emitted
+/// as they printed. The JSON report is unchanged.
+fn emit_refusal(report: &serde_json::Value) {
     use vyges_events::{emit, Event, Severity};
-    for l in report["lines"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
-        let parsed = l.strip_prefix('[').and_then(|r| r.split_once("] ")).and_then(|(head, text)| head.split_once(' ').map(|(sev, code)| (sev, code, text)));
-        let ev = match parsed {
-            Some((sev, code, text)) => {
-                let severity = match sev {
-                    "ERROR" | "CRITICAL" => Severity::Error,
-                    "WARNING" => Severity::Warn,
-                    _ => Severity::Info,
-                };
-                Event::new("vyges-gpl", severity, text.to_string()).with_code(code)
-            }
-            None => Event::new("vyges-gpl", Severity::Info, l.to_string()),
-        };
-        emit(&ev);
-    }
     if report["status"] == "refused" {
         if let Some(why) = report["reason"].as_str() {
             emit(&Event::new("vyges-gpl", Severity::Warn, why.to_string()).with_code("GPL-REFUSED"));
@@ -575,7 +559,7 @@ fn main() -> std::process::ExitCode {
         },
     };
     let status = report["status"].as_str().unwrap_or("error").to_string();
-    emit_events(&report);
+    emit_refusal(&report);
     let text = format!("{report}\n");
     match &out {
         Some(f) => {

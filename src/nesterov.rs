@@ -3125,7 +3125,7 @@ impl Nesterov {
         let locations = placed_locations(td.common, self);
         let report = td.router.find_resize_slacks(log, &locations, repair, td.state.repair_tns_end_percent)?;
         for l in &report.lines {
-            log.report(l.clone());
+            log.relay(l);
         }
         let absorbed = self.absorb_netlist(&td.design, &report.design, &report, td.common, td.pad_right)?;
         td.design = report.design;

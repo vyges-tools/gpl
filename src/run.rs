@@ -380,8 +380,8 @@ mod tests {
         assert_eq!(k.get("-bin_grid_count").map(String::as_str), Some("64"));
         assert_eq!(f, ["-skip_io", "-disable_pin_density_adjust"]);
         assert!(parse_key_args(&mut log, "global_placement", &s(&["-verbose"]), KEYS, FLAGS).is_err());
-        assert_eq!(log.lines.last().unwrap(), "[ERROR STA-0562] global_placement -verbose is not a known keyword or flag.");
+        assert_eq!(log.lines().last().unwrap(), "[ERROR STA-0562] global_placement -verbose is not a known keyword or flag.");
         assert!(parse_key_args(&mut log, "global_placement", &s(&["x"]), KEYS, FLAGS).is_err());
-        assert_eq!(log.lines.last().unwrap(), "[ERROR STA-0564] global_placement positional arguments not supported.");
+        assert_eq!(log.lines().last().unwrap(), "[ERROR STA-0564] global_placement positional arguments not supported.");
     }
 }

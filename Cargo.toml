@@ -10,11 +10,12 @@ repository = "https://github.com/vyges-tools/gpl"
 
 [features]
 # The command-line engine: the database and JSON jobs.
-cli = ["dep:vyges-events", "dep:vyges-opendb", "vyges-opendb/gen-write", "dep:serde_json", "dep:vyges-grt", "dep:vyges-stt", "dep:vyges-rsz"]
+cli = ["dep:vyges-opendb", "vyges-opendb/gen-write", "dep:serde_json", "dep:vyges-grt", "dep:vyges-stt", "dep:vyges-rsz"]
 
 [dependencies]
-# The run's lines as structured events (the CLI's events trail).
-vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false, optional = true }
+# The suite's logger: the run's lines in the reference's format, each also an event (the CLI's
+# events trail).
+vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
 # Routability-driven placement measures congestion on the global router's grid (its capacities
 # after adjustment), as the reference's RUDY does.
