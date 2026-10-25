@@ -10,6 +10,10 @@
 //! - [`log`]: the output lines and how a run stops.
 //! - [`ooura`]: the 2-D cosine/sine transforms of the density solver.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_gpl::…` paths resolve here.
+extern crate self as vyges_gpl;
+
 pub mod bicgstab;
 #[cfg(feature = "cli")]
 pub mod db_router;
@@ -25,3 +29,10 @@ pub mod placer_base;
 pub mod route_base;
 pub mod run;
 pub mod timing_driven;
+
+/// The `vyges-gpl` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;

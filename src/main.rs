@@ -499,7 +499,7 @@ fn emit_refusal(report: &serde_json::Value) {
     }
 }
 
-fn main() -> std::process::ExitCode {
+pub fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut out: Option<String> = None;

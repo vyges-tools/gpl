@@ -9,6 +9,9 @@ homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/gpl"
 
 [features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = ["cli"]
 # The command-line engine: the database and JSON jobs.
 cli = ["dep:vyges-opendb", "vyges-opendb/gen-write", "dep:serde_json", "dep:vyges-grt", "dep:vyges-stt", "dep:vyges-rsz"]
 
