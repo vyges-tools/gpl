@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-grt"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "vyges-est",
  "vyges-opendb",
@@ -492,6 +492,7 @@ name = "vyges-opendb"
 version = "0.1.49"
 dependencies = [
  "cxx",
+ "miniz_oxide 0.8.9",
  "serde",
  "serde_json",
  "vyges-events",
@@ -512,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-rsz"
-version = "0.1.48"
+version = "0.1.49"
 dependencies = [
  "flate2",
  "serde_json",
