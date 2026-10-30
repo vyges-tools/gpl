@@ -1,6 +1,6 @@
 [package]
 name = "vyges-gpl"
-version = "0.1.50"
+version = "0.1.51"
 edition = "2021"
 description = "Global placement: the placer's view of the design (instances, nets, pins, regions), then initial and Nesterov placement."
 license = "Apache-2.0"
