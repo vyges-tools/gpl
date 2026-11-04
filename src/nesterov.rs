@@ -87,7 +87,15 @@ const MIN_PRECONDITIONER: f32 = 1.0;
 const MAX_RECURSION_WL_COEF: i32 = 10;
 const MAX_RECURSION_INIT_SLP_COEF: i32 = 10;
 const REFERENCE_HPWL_FLOOR: f32 = 446_000_000.0;
-const REFERENCE_HPWL_FRACTION: f32 = 1.0;
+/// The fraction of the design's HPWL a derived reference HPWL spans. Upstream `6ce7bdb41ad`
+/// (2026-10-05) cut it from 1.0 to 0.01, because 1.0 let large designs take steps that were too large.
+const REFERENCE_HPWL_FRACTION: f32 = 0.01;
+
+/// `NesterovPlaceVars::referenceHpwl`: the user's `-reference_hpwl` when it is set, otherwise the
+/// larger of the floor and the fraction of the design's HPWL. The arithmetic is in f32, as upstream's is.
+fn derived_reference_hpwl(user: f32, design_hpwl: i64) -> f32 {
+    if user > 0.0 { user } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct FloatPoint {
@@ -3545,7 +3553,7 @@ pub fn placed_locations(c: &Common, nb: &Nesterov) -> Vec<(usize, i32, i32)> {
 pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, route: Option<&mut Routability<'_>>, td: Option<&mut TimingDriven<'_>>) -> Res<i32> {
     // `NesterovPlaceVars`: the reference HPWL, from the design's own (initial) HPWL when unset.
     let design_hpwl = np.hpwl();
-    np.reference_hpwl = if np.o.reference_hpwl > 0.0 { np.o.reference_hpwl } else { REFERENCE_HPWL_FLOOR.max(REFERENCE_HPWL_FRACTION * design_hpwl as f32) };
+    np.reference_hpwl = derived_reference_hpwl(np.o.reference_hpwl, design_hpwl);
     np.np_init(log)?;
     resume_nesterov_place(log, d, np, 0, route, td)
 }
@@ -3719,6 +3727,20 @@ fn vyg_dump_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`NesterovPlaceVars`, `6ce7bdb41ad`): with no `-reference_hpwl`, the reference
+    /// HPWL is max(floor 4.46e8, 0.01 x design HPWL). A design whose HPWL is above 4.46e10 takes the
+    /// fraction (it took the whole HPWL before), a smaller one takes the floor, and a value the user
+    /// sets wins over both.
+    #[test]
+    fn derived_reference_hpwl_is_a_hundredth_of_the_design_above_the_floor() {
+        let big = derived_reference_hpwl(0.0, 100_000_000_000);
+        assert_eq!(big, 0.01_f32 * 100_000_000_000_i64 as f32, "the f32 product, as upstream computes it");
+        assert!((big - 1.0e9).abs() < 1.0e3 && big != 1.0e11_f32, "a hundredth of the HPWL, not all of it: {big}");
+        assert_eq!(derived_reference_hpwl(0.0, 1_000_000_000), 446_000_000.0);
+        assert_eq!(derived_reference_hpwl(0.0, 44_600_000_000), 446_000_000.0);
+        assert_eq!(derived_reference_hpwl(123.0, 100_000_000_000), 123.0);
+    }
 
     /// A cluster cell is not its instances' bounding box: it is centred on that box's integer
     /// centre and holds their total area at the core's aspect ratio, each side truncated.
