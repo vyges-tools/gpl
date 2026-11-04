@@ -366,6 +366,8 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     // Phase 1 may run out of its iterations short of the target: phase 2 finishes from there.
     let phase1_missed_target = !phase1_diverged && np.average_overflow() > o.overflow;
     if phase1_diverged || phase1_missed_target {
+        // phase 2 ramps the density penalty up in place when the overflow regresses
+        np.enable_incremental_density_penalty_guard();
         iter = nesterov::continue_nesterov_place(log, d, &mut np, o.overflow, o.max_iter, iter + 1)?;
     }
     let locations = nesterov::placed_locations(&common, &np);

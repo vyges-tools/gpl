@@ -728,6 +728,8 @@ pub struct Nesterov {
     /// `allow_divergence_recovery_`: a divergence warns and the loop returns, instead of an
     /// error (incremental placement's first pass only).
     allow_divergence_recovery: bool,
+    /// `incremental_penalty_guard_requested_`: the next loop runs the density-penalty guard.
+    incremental_penalty_guard_requested: bool,
     /// `is_routability_need_`.
     routability_need: bool,
     /// `minRcCellSize_`: each standard instance cell's size at the minimum congestion so far.
@@ -866,6 +868,7 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         num_region_diverged: 0,
         diverge: None,
         allow_divergence_recovery: false,
+        incremental_penalty_guard_requested: false,
         routability_need: true,
         min_rc_cell_size: vec![],
         port_gpin: std::collections::HashMap::new(),
@@ -3691,7 +3694,52 @@ pub fn continue_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, ove
     resume_nesterov_place(log, d, np, start_iter, None, None)
 }
 
+/// The density-penalty guard's state across one loop: the factor, the best overflow seen, the
+/// escalations so far.
+struct PenaltyGuard {
+    factor: f32,
+    best_overflow: f32,
+    retries: i32,
+}
+
 impl Nesterov {
+    /// `enableIncrementalDensityPenaltyGuard`: the next loop runs the guard.
+    pub fn enable_incremental_density_penalty_guard(&mut self) {
+        self.incremental_penalty_guard_requested = true;
+    }
+
+    /// `applyDensityPenaltyFactor`: every region's penalty from its gradient-sum ratio
+    /// (`updateDensityPenaltyFromRatio`), times `factor`; `factor` alone when the density sum is 0.
+    fn apply_density_penalty_factor(&mut self, factor: f32) {
+        for nb in self.nbs.iter_mut() {
+            nb.density_penalty = if nb.density_grad_sum != 0.0 { (nb.wl_grad_sum / nb.density_grad_sum) * factor } else { factor };
+        }
+    }
+
+    /// `guardIncrementalDensityPenalty`, once per iteration: an overflow below the best by more
+    /// than 0.005 is the new best; one above it by more than 0.005 doubles the factor and applies
+    /// it (GPL-0193), at most 10 times.
+    fn guard_incremental_density_penalty(&mut self, log: &mut Log, g: &mut PenaltyGuard) {
+        const OVERFLOW_TOLERANCE: f32 = 0.005;
+        const GROWTH_RATIO: f32 = 2.0;
+        const MAX_RETRIES: i32 = 10;
+        let ov = self.average_overflow_unscaled;
+        if ov < g.best_overflow - OVERFLOW_TOLERANCE {
+            g.best_overflow = ov;
+            return;
+        }
+        if ov <= g.best_overflow + OVERFLOW_TOLERANCE {
+            return;
+        }
+        if g.retries >= MAX_RETRIES {
+            return;
+        }
+        g.retries += 1;
+        g.factor *= GROWTH_RATIO;
+        self.apply_density_penalty_factor(g.factor);
+        log.info("GPL", 193, format!("Incremental density-penalty guard: overflow regressed past {:.3}; escalating the penalty factor to {} in place (retry {}).", g.best_overflow, g.factor, g.retries));
+    }
+
     /// `setAllowDivergenceRecovery`.
     pub fn set_allow_divergence_recovery(&mut self, allow: bool) {
         self.allow_divergence_recovery = allow;
@@ -3751,6 +3799,14 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         }
         return log.error("GPL", code, msg);
     }
+    // the density-penalty guard (incremental placement's second pass; not with routability)
+    let guard_active = np.incremental_penalty_guard_requested && np.o.routability.is_none();
+    np.incremental_penalty_guard_requested = false;
+    let mut guard = PenaltyGuard { factor: 1.0, best_overflow: np.average_overflow_unscaled, retries: 0 };
+    if guard_active {
+        np.apply_density_penalty_factor(guard.factor);
+        log.info("GPL", 191, format!("Incremental density-penalty guard enabled: penalty factor {}, starting overflow {:.3}.", guard.factor, guard.best_overflow));
+    }
     let mut original_area = 0i64;
     for nb in np.nbs.iter_mut() {
         nb.max_phi_coef_changed = false;
@@ -3781,6 +3837,9 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         np.np_update_next_iter(log, d, iter);
         for b in 0..np.nbs.len() {
             np.probe(log, b, "IT", iter, np.wl_coef_x, cur_a);
+        }
+        if guard_active {
+            np.guard_incremental_density_penalty(log, &mut guard);
         }
         let routability = np.o.routability.is_some();
         // `is_routability_gpl_iter`: each such iteration extends the limit by one
