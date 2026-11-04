@@ -1332,6 +1332,7 @@ fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &m
 /// σ = 0.3072 · r, r the given distance (scaled by DBU/1000) or min(half a micron, a row); each
 /// rounded; the instance and its pins moved, its cell rebuilt. A distance of exactly 0, or no row
 /// height, draws nothing.
+#[allow(clippy::too_many_arguments)]
 fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, inst_cell: &[Option<usize>], gcells: &mut [GCell], o: &Opts, rng: &mut Mt19937) {
     let dist = o.perturb_dist;
     let draws = c.site_y > 0 && dist != 0.0;
@@ -3759,7 +3760,9 @@ impl Nesterov {
         }
     }
 
-    /// `getAverageOverflow`: the unscaled average overflow of the last iteration.
+    /// `getAverageOverflow`: the unscaled average overflow of the last iteration (the
+    /// reference's name; it returns `average_overflow_unscaled_`).
+    #[allow(clippy::misnamed_getters)]
     pub fn average_overflow(&self) -> f32 {
         self.average_overflow_unscaled
     }
