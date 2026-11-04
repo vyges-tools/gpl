@@ -3567,6 +3567,13 @@ pub fn continue_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, ove
     resume_nesterov_place(log, d, np, start_iter, None, None)
 }
 
+impl Nesterov {
+    /// `getAverageOverflow`: the unscaled average overflow of the last iteration.
+    pub fn average_overflow(&self) -> f32 {
+        self.average_overflow_unscaled
+    }
+}
+
 /// `PlacerBase::unlockAll` for every region: no cell (and no instance) locked.
 pub fn unlock_all(np: &mut Nesterov, c: &mut Common) {
     for g in np.gcells.iter_mut().filter(|g| g.is_instance()) {

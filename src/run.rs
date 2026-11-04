@@ -333,10 +333,10 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
         log.info("GPL", 156, "Identified all instances as placed. Skipping incremental mode");
         return Ok(Outcome::Unchanged(common, bases));
     }
+    // Phase 1: the unplaced instances with everything else locked, the command's own options
+    // capped at 600 iterations (upstream 8ee41e02b7c: no overflow floor, no uniform density).
     let mut locked = o.clone();
-    locked.overflow = o.overflow.max(0.2);
-    locked.max_iter = 300;
-    locked.uniform_density = true;
+    locked.max_iter = 600;
     // doInitialPlace on the placer that exists: no construction, no GPL-0123.
     check_place_ios_supported(log, d, v)?;
     let mut ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
@@ -348,7 +348,9 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     router.report_hpwl(log)?;
     log.info("GPL", 133, "Unlocking all instances");
     nesterov::unlock_all(&mut np, &mut common);
-    if o.overflow < locked.overflow {
+    // Phase 1 may run out of its iterations short of the target: phase 2 finishes from there.
+    let phase1_missed_target = np.average_overflow() > o.overflow;
+    if phase1_missed_target {
         iter = nesterov::continue_nesterov_place(log, d, &mut np, o.overflow, o.max_iter, iter + 1)?;
     }
     let locations = nesterov::placed_locations(&common, &np);
