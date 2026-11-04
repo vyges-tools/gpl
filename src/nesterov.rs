@@ -725,6 +725,9 @@ pub struct Nesterov {
     diverge_snapshot_overflow: f32,
     num_region_diverged: i32,
     diverge: Option<(u32, &'static str)>,
+    /// `allow_divergence_recovery_`: a divergence warns and the loop returns, instead of an
+    /// error (incremental placement's first pass only).
+    allow_divergence_recovery: bool,
     /// `is_routability_need_`.
     routability_need: bool,
     /// `minRcCellSize_`: each standard instance cell's size at the minimum congestion so far.
@@ -862,6 +865,7 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         diverge_snapshot_overflow: 0.0,
         num_region_diverged: 0,
         diverge: None,
+        allow_divergence_recovery: false,
         routability_need: true,
         min_rc_cell_size: vec![],
         port_gpin: std::collections::HashMap::new(),
@@ -3688,6 +3692,25 @@ pub fn continue_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, ove
 }
 
 impl Nesterov {
+    /// `setAllowDivergenceRecovery`.
+    pub fn set_allow_divergence_recovery(&mut self, allow: bool) {
+        self.allow_divergence_recovery = allow;
+    }
+
+    /// `divergedLastRun`: a region diverged.
+    pub fn diverged_last_run(&self) -> bool {
+        self.num_region_diverged > 0
+    }
+
+    /// `clearDivergence`: no region diverged, no message, every region's flag down.
+    pub fn clear_divergence(&mut self) {
+        self.num_region_diverged = 0;
+        self.diverge = None;
+        for nb in self.nbs.iter_mut() {
+            nb.is_diverged = false;
+        }
+    }
+
     /// `getAverageOverflow`: the unscaled average overflow of the last iteration.
     pub fn average_overflow(&self) -> f32 {
         self.average_overflow_unscaled
@@ -3719,8 +3742,13 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
     if let Some(t) = td.as_mut() {
         t.router.resize_slack_preamble(log)?;
     }
+    // diverged in `init`: the loop is skipped
     if np.num_region_diverged > 0 {
         let (code, msg) = np.diverge.unwrap_or((0, ""));
+        if np.allow_divergence_recovery {
+            log.warn("GPL", code, msg);
+            return Ok(start_iter);
+        }
         return log.error("GPL", code, msg);
     }
     let mut original_area = 0i64;
@@ -3840,7 +3868,11 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
     log.info("GPL", 1014, format!("Final placement area: {:.2} ({:+.2}%)", dbu_area(d, new_area as f64), diff));
     if np.num_region_diverged > 0 {
         let (code, msg) = np.diverge.unwrap_or((0, ""));
-        return log.error("GPL", code, msg);
+        if np.allow_divergence_recovery {
+            log.warn("GPL", code, msg);
+        } else {
+            return log.error("GPL", code, msg);
+        }
     }
     Ok(iter)
 }

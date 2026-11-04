@@ -347,16 +347,25 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     for b in 0..np.nbs.len() {
         np.redistribute_filler_cells(log, b);
     }
+    // Phase 1 may diverge and hand over to phase 2: a divergence warns instead of stopping.
+    np.set_allow_divergence_recovery(true);
     let mut iter = nesterov::run_nesterov_loop(log, d, &mut np)?;
+    let phase1_diverged = np.diverged_last_run();
     // `updateDb` then `reportHpwlMetric` at the end of this pass
     let Some(router) = router else { return refuse("-incremental needs the design database to write between its passes") };
     router.write_locations(log, &nesterov::placed_locations(&common, &np))?;
     router.report_hpwl(log)?;
+    if phase1_diverged {
+        log.warn("GPL", 195, format!("Phase 1 of incremental placement diverged before reaching overflow {:.3}; continuing to phase 2 anyway.", locked.overflow));
+        np.clear_divergence();
+    }
+    // Phase 2 has no fallback: a divergence there stops the run.
+    np.set_allow_divergence_recovery(false);
     log.info("GPL", 133, "Unlocking all instances");
     nesterov::unlock_all(&mut np, &mut common);
     // Phase 1 may run out of its iterations short of the target: phase 2 finishes from there.
-    let phase1_missed_target = np.average_overflow() > o.overflow;
-    if phase1_missed_target {
+    let phase1_missed_target = !phase1_diverged && np.average_overflow() > o.overflow;
+    if phase1_diverged || phase1_missed_target {
         iter = nesterov::continue_nesterov_place(log, d, &mut np, o.overflow, o.max_iter, iter + 1)?;
     }
     let locations = nesterov::placed_locations(&common, &np);
