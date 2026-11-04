@@ -3065,6 +3065,10 @@ impl Nesterov {
     /// slack (GPL-0106); every net with more than one pin weighted from its driver's slack. False
     /// when there are no slacks (GPL-0105, GPL-0102).
     fn timing_weights(&mut self, log: &mut Log, slacks: &[(String, f32)], c: &Common, design: &Design, st: &crate::timing_driven::TdState) -> bool {
+        // `findResizeSlacks1`: an unconstrained net (its slack fuzzy-infinite) is neither ranked
+        // nor weighted — it is not in the slack map at all
+        let slacks: Vec<(String, f32)> = slacks.iter().filter(|(_, s)| !crate::timing_driven::fuzzy_inf(*s)).cloned().collect();
+        let slacks = slacks.as_slice();
         let worst = crate::timing_driven::worst_slack_nets(slacks, st.nets_percentage);
         if worst.is_empty() {
             log.warn("GPL", 105, "Timing-driven: no net slacks found. Timing-driven mode disabled.");
@@ -3075,7 +3079,7 @@ impl Nesterov {
         let worst_slack = slacks[worst[0]].1;
         let slack_min = slacks[worst[anchor]].1;
         let slack_max = slacks[*worst.last().expect("a worst net")].1;
-        if worst_slack >= 1e30f32 * 0.999 {
+        if crate::timing_driven::fuzzy_inf(worst_slack) {
             log.warn("GPL", 102, "Timing-driven: no slacks found. Timing-driven mode disabled.");
             return false;
         }

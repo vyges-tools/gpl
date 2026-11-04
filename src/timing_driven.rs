@@ -89,6 +89,12 @@ pub fn worst_slack_nets(slacks: &[(String, f32)], percent: f32) -> Vec<usize> {
     idx
 }
 
+/// OpenSTA `fuzzyInf`: equal, within a relative 1e-6, to plus or minus `INF` (1e30).
+pub fn fuzzy_inf(v: f32) -> bool {
+    let eq = |a: f32, b: f32| a == b || (a - b).abs() < 1e-6 * a.abs().max(b.abs());
+    eq(v, 1e30) || eq(v, -1e30)
+}
+
 /// `kSlackMinPercent`: the weight ramp's worst end sits this percentage of the whole design's
 /// constrained nets in from the worst net.
 pub const SLACK_MIN_PERCENT: f64 = 0.2;
@@ -154,6 +160,12 @@ mod tests {
                 assert!(slack_ramp_anchor_index(n, pct) < n, "net_count {n} nets_percentage {pct}");
             }
         }
+    }
+
+    #[test]
+    fn unconstrained_is_fuzzy_inf() {
+        assert!(fuzzy_inf(1e30) && fuzzy_inf(-1e30) && fuzzy_inf(1e30 * (1.0 - 5e-7)));
+        assert!(!fuzzy_inf(1e30 * (1.0 - 2e-6)) && !fuzzy_inf(1.38e-9) && !fuzzy_inf(0.0));
     }
 
     #[test]
