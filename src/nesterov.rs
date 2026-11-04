@@ -3312,19 +3312,19 @@ impl Nesterov {
             log.warn("GPL", 312, format!("Unexpected filler area! The value {}, should be equal to totalFillerArea_ {}.", dbu_area(d, (single * nb.fillers as i64) as f64), dbu_area(d, nb.total_filler_area as f64)));
         }
         let count_pct = if count_before != 0 { (nb.fillers as i64 - count_before as i64) as f64 / count_before as f64 * 100.0 } else { 0.0 };
-        log.info("GPL", 76, format!("Removing fillers, count: Before: {}, After: {} ({:+.2}%)", count_before, nb.fillers, count_pct));
+        log.debug("GPL", "routability", 1, || format!("Removing fillers, count: Before: {}, After: {} ({:+.2}%)", count_before, nb.fillers, count_pct));
         let area_pct = if area_before != 0 { (nb.total_filler_area - area_before) as f64 / area_before as f64 * 100.0 } else { 0.0 };
-        log.info("GPL", 77, format!("Filler area (um^2)     : Before: {:.3}, After: {:.3} ({:+.2}%)", dbu_area(d, area_before as f64), dbu_area(d, nb.total_filler_area as f64), area_pct));
+        log.debug("GPL", "routability", 1, || format!("Filler area (um^2)     : Before: {:.3}, After: {:.3} ({:+.2}%)", dbu_area(d, area_before as f64), dbu_area(d, nb.total_filler_area as f64), area_pct));
         let removed_area = single * removed;
         let remaining = inflation_area - removed_area;
-        log.info("GPL", 78, format!("Removed fillers count: {}, area removed: {:.3} um^2. Remaining area to be compensated by modifying density: {:.3} um^2", removed, dbu_area(d, removed_area as f64), dbu_area(d, remaining as f64)));
+        log.debug("GPL", "routability", 1, || format!("Removed fillers count: {}, area removed: {:.3} um^2. Remaining area to be compensated by modifying density: {:.3} um^2", removed, dbu_area(d, removed_area as f64), dbu_area(d, remaining as f64)));
         if remaining > single {
             let total = nesterov_insts_area(nb) + removed_area + nb.total_filler_area + remaining;
             let density = total as f32 / nb.white_space_area as f32;
             self.set_target_density(b, density);
             let nb = &mut self.nbs[b];
             nb.movable_area = (nb.white_space_area as f32 * nb.target_density) as i64;
-            log.info("GPL", 79, format!("New target density: {}", nb.target_density));
+            log.debug("GPL", "routability", 1, || format!("New target density: {}", nb.target_density));
         }
     }
 
@@ -3332,7 +3332,7 @@ impl Nesterov {
     /// end, in the order it was taken (GPL-0080..0082).
     fn restore_removed_fillers(&mut self, log: &mut Log, d: &Design, b: usize) {
         let n = self.nbs[b].removed_fillers.len();
-        log.info("GPL", 80, format!("Restoring {n} previously removed fillers."));
+        log.debug("GPL", "routability", 1, || format!("Restoring {n} previously removed fillers."));
         if n == 0 {
             return;
         }
@@ -3347,8 +3347,8 @@ impl Nesterov {
         }
         let count_pct = if count_before > 0 { (nb.fillers - count_before) as f64 / count_before as f64 * 100.0 } else { 0.0 };
         let area_pct = if area_before > 0 { (nb.total_filler_area - area_before) as f64 / area_before as f64 * 100.0 } else { 0.0 };
-        log.info("GPL", 81, format!("Number of fillers before restoration {} and after {} . Relative change: {:+.2}%%", count_before, nb.fillers, count_pct));
-        log.info("GPL", 82, format!("Total filler area before restoration {:.2} and after {:.2} (um^2). Relative change: {:+.2}%%", dbu_area(d, area_before as f64), dbu_area(d, nb.total_filler_area as f64), area_pct));
+        log.debug("GPL", "routability", 1, || format!("Number of fillers before restoration {} and after {} . Relative change: {:+.2}%%", count_before, nb.fillers, count_pct));
+        log.debug("GPL", "routability", 1, || format!("Total filler area before restoration {:.2} and after {:.2} (um^2). Relative change: {:+.2}%%", dbu_area(d, area_before as f64), dbu_area(d, nb.total_filler_area as f64), area_pct));
     }
 
     /// `revertToMinCongestion`: every standard cell back to its size at the minimum congestion,
