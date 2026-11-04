@@ -3355,8 +3355,12 @@ impl Nesterov {
     /// each region to that pass's target density with its removed fillers restored; the
     /// accumulated inflation as it stood then (GPL-0055..0057).
     fn revert_to_min_congestion(&mut self, log: &mut Log, d: &Design, rb: &mut RouteBase, common: &Common) {
-        log.info("GPL", 55, "Reverting inflation values and target density from the iteration with minimum observed routing congestion.");
-        log.info("GPL", 56, format!("Minimum observed routing congestion: {:.4}", rb.min_rc));
+        // before the first pass there is no minimum on record (upstream 4cdc53a902b)
+        if rb.revert_count < 1 {
+            return;
+        }
+        let first = rb.min_rc_target_density.first().copied().unwrap_or(0.0);
+        log.info("GPL", 55, format!("Reverting inflation and target density to the pass with the minimum observed routing congestion ({:.4}), target density {:.4}.", rb.min_rc, first));
         for gi in 0..self.gcells.len() {
             if self.is_std_instance(gi) {
                 let (dx, dy) = self.min_rc_cell_size[gi];
@@ -3365,7 +3369,8 @@ impl Nesterov {
         }
         for b in 0..self.nbs.len() {
             let group = self.nbs[b].group.as_ref().map(|g| format!(" ({g})")).unwrap_or_default();
-            log.info("GPL", 57, format!("Target density at minimum routing congestion: {:.4}{}", rb.min_rc_target_density[b], group));
+            let td = rb.min_rc_target_density[b];
+            log.debug("GPL", "routability", 1, || format!("Target density at minimum routing congestion: {td:.4}{group}"));
             self.set_target_density(b, rb.min_rc_target_density[b]);
             self.restore_removed_fillers(log, d, b);
             update_density_size(&mut self.gcells, &self.nbs[b]);
@@ -3424,7 +3429,8 @@ impl Nesterov {
         }
         let scale = 0.0f64.max(allowed / wanted);
         rb.scale_inflated(scale);
-        log.info("GPL", 99, format!("Routability inflation trimmed to {:.2}% of what this iteration asked for; {:.2}% of the {:.2}% budget still unspent.", 100.0 * scale, 100.0 * (budget - spent - allowed) / rb.original_movable_area as f64, 100.0 * f64::from(rb.vars.max_inflation_total)));
+        let (unspent, total) = (100.0 * (budget - spent - allowed) / rb.original_movable_area as f64, 100.0 * f64::from(rb.vars.max_inflation_total));
+        log.debug("GPL", "routability", 1, || format!("Routability inflation trimmed to {:.2}% of what this iteration asked for; {:.2}% of the {:.2}% budget still unspent.", 100.0 * scale, unspent, total));
         spent + allowed >= budget
     }
 
@@ -3446,7 +3452,7 @@ impl Nesterov {
             return Ok((false, false));
         }
         if (r.rb.min_rc - cur_rc) > r.rb.min_rc * 0.005f32 {
-            log.info("GPL", 48, format!("Routing congestion ({:.4}) lower than previous minimum ({}). Updating minimum.", cur_rc, fmt_g_prec(f64::from(r.rb.min_rc), 4)));
+            log.info("GPL", 48, format!("Congestion improved on previous minimum ({}); updating minimum.", fmt_g_prec(f64::from(r.rb.min_rc), 4)));
             r.rb.min_rc = cur_rc;
             r.rb.min_rc_violated = 0;
             for b in 0..self.nbs.len() {
@@ -3458,7 +3464,7 @@ impl Nesterov {
             r.rb.min_rc_net_weights = r.rb.net_weights.clone();
         } else {
             r.rb.min_rc_violated += 1;
-            log.info("GPL", 49, format!("Routing congestion ({:.4}) higher than minimum ({:.4}). Consecutive non-improvement count: {}.", cur_rc, r.rb.min_rc, r.rb.min_rc_violated));
+            log.info("GPL", 49, format!("No improvement on minimum ({:.4}); consecutive non-improvement count: {}.", r.rb.min_rc, r.rb.min_rc_violated));
         }
         r.rb.set_inflated_ratios();
         let budget_spent = self.scale_inflation_to_budget(log, &mut r.rb);
@@ -3487,14 +3493,19 @@ impl Nesterov {
             let delta = r.rb.inflated_delta[b];
             let nb = &self.nbs[b];
             let pct = (delta as f32 / nesterov_insts_area(nb) as f32) * 100.0f32;
-            log.info("GPL", 86, format!("Inflated area:              {:10.3} um^2 ({:+.2}%)", dbu_area(d, delta as f64) as f32, pct));
-            log.info("GPL", 52, format!("Placement target density:   {:10.4}", nb.target_density));
+            let delta_um2 = dbu_area(d, delta as f64) as f32;
             prev_white[b] = nb.white_space_area as f64;
             prev_movable[b] = nb.movable_area as f64;
             prev_filler[b] = nb.total_filler_area as f64;
             prev_total[b] = (nesterov_insts_area(nb) + nb.total_filler_area) as f64;
             prev_expected[b] = delta as f64 + prev_total[b];
             self.cut_filler_cells(log, d, b, delta);
+            {
+                let nb = &self.nbs[b];
+                let spent = if r.rb.original_movable_area > 0 { 100.0 * r.rb.total_inflation() as f64 / r.rb.original_movable_area as f64 } else { 0.0 };
+                let group = nb.group.as_ref().map(|g| format!(" in group {g}")).unwrap_or_default();
+                log.info("GPL", 86, format!("Inflation {:+.3} um^2 ({:+.2}% of movable), {:.2}% of the {:.2}% budget spent; target density {:.4}{}.", delta_um2, pct, spent, 100.0 * f64::from(v.max_inflation_total), nb.target_density, group));
+            }
             if self.nbs[b].target_density > v.max_density {
                 let nb = &self.nbs[b];
                 let group = nb.group.as_ref().map(|g| format!(" in group {g}")).unwrap_or_default();
@@ -3518,12 +3529,12 @@ impl Nesterov {
             let nb = &self.nbs[b];
             let new_total = (nesterov_insts_area(nb) + nb.total_filler_area) as f64;
             let new_expected = r.rb.inflated_delta[b] as f64 + new_total;
-            log.info("GPL", 58, format!("White space area:           {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.white_space_area as f64), percent_diff(prev_white[b], nb.white_space_area as f64)));
-            log.info("GPL", 59, format!("Movable instances area:     {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.movable_area as f64), percent_diff(prev_movable[b], nb.movable_area as f64)));
-            log.info("GPL", 60, format!("Total filler area:          {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.total_filler_area as f64), percent_diff(prev_filler[b], nb.total_filler_area as f64)));
-            log.info("GPL", 61, format!("Total non-inflated area:    {:10.3} um^2 ({:+.2}%)", dbu_area(d, new_total), percent_diff(prev_total[b], new_total)));
-            log.info("GPL", 62, format!("Total inflated area:        {:10.3} um^2 ({:+.2}%)", dbu_area(d, new_expected), percent_diff(prev_expected[b], new_expected)));
-            log.info("GPL", 63, format!("New Target Density:         {:10.4}", nb.target_density));
+            log.debug("GPL", "routability", 1, || format!("White space area:           {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.white_space_area as f64), percent_diff(prev_white[b], nb.white_space_area as f64)));
+            log.debug("GPL", "routability", 1, || format!("Movable instances area:     {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.movable_area as f64), percent_diff(prev_movable[b], nb.movable_area as f64)));
+            log.debug("GPL", "routability", 1, || format!("Total filler area:          {:10.3} um^2 ({:+.2}%)", dbu_area(d, nb.total_filler_area as f64), percent_diff(prev_filler[b], nb.total_filler_area as f64)));
+            log.debug("GPL", "routability", 1, || format!("Total non-inflated area:    {:10.3} um^2 ({:+.2}%)", dbu_area(d, new_total), percent_diff(prev_total[b], new_total)));
+            log.debug("GPL", "routability", 1, || format!("Total inflated area:        {:10.3} um^2 ({:+.2}%)", dbu_area(d, new_expected), percent_diff(prev_expected[b], new_expected)));
+            log.debug("GPL", "routability", 1, || format!("New Target Density:         {:10.4}", nb.target_density));
             update_density_size(&mut self.gcells, &self.nbs[b]);
         }
         // `weightCongestedNets`

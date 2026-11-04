@@ -285,7 +285,7 @@ pub struct RouteBase {
     size_y: i32,
     /// `tg_->lx(), ly()`: 0 on the RUDY grid, the first gridline on the router's.
     grid_origin: (i32, i32),
-    revert_count: i32,
+    pub revert_count: i32,
     final_average_rc: f32,
     /// `minRc_` (1e30 until a pass measures), `min_RC_violated_cnt_`.
     pub min_rc: f32,
@@ -298,6 +298,11 @@ pub struct RouteBase {
     pub min_rc_inflated: Vec<i64>,
     /// `original_movable_area_`: the regions' instance area when the route base was built.
     pub original_movable_area: i64,
+    /// `overflowed_tiles_count_` / `actionable_tiles_count_` / `total_route_overflow_`: the last
+    /// measurement's, for the pass header.
+    overflowed_tiles_count: usize,
+    actionable_tiles_count: usize,
+    total_route_overflow: f64,
     /// `netWeights_` / `minRcNetWeights_`: by design net, the nets routability reweighted.
     pub net_weights: std::collections::HashMap<usize, f32>,
     pub min_rc_net_weights: std::collections::HashMap<usize, f32>,
@@ -323,6 +328,9 @@ impl RouteBase {
             accumulated: vec![],
             min_rc_inflated: vec![],
             original_movable_area: 0,
+            overflowed_tiles_count: 0,
+            actionable_tiles_count: 0,
+            total_route_overflow: 0.0,
             net_weights: std::collections::HashMap::new(),
             min_rc_net_weights: std::collections::HashMap::new(),
         }
@@ -442,7 +450,7 @@ impl RouteBase {
         let (cnt_x, cnt_y, size) = (rudy.cnt_x, rudy.cnt_y, rudy.tile_size);
         // `initTiles(use_rudy)`: no layer count to report on the RUDY grid
         if !self.vars.use_rudy {
-            log.info("GPL", 39, "Number of routing layers: 0");
+            log.debug("GPL", "routability", 1, || "Number of routing layers: 0".to_string());
         }
         self.cnt_x = cnt_x;
         self.cnt_y = cnt_y;
@@ -495,11 +503,15 @@ impl RouteBase {
             }
         }
         let actionable = cong.len();
+        self.total_route_overflow = total_overflow;
+        self.overflowed_tiles_count = overflowed;
+        self.actionable_tiles_count = actionable;
         if verbose {
-            log.info("GPL", 88, format!("Tiles the placer can act on: {} of {} ({:.2}%)", actionable, self.tiles.len(), actionable as f64 / self.tiles.len() as f64 * 100.0));
-            log.info("GPL", 41, format!("Total routing overflow: {total_overflow:.4}"));
+            let n = self.tiles.len();
+            log.debug("GPL", "routability", 1, || format!("Tiles the placer can act on: {} of {} ({:.2}%)", actionable, n, actionable as f64 / n as f64 * 100.0));
+            log.debug("GPL", "routability", 1, || format!("Total routing overflow: {total_overflow:.4}"));
             let pct = if actionable > 0 { overflowed as f64 / actionable as f64 * 100.0 } else { 0.0 };
-            log.info("GPL", 42, format!("Number of overflowed tiles: {overflowed} ({pct:.2}%)"));
+            log.debug("GPL", "routability", 1, || format!("Number of overflowed tiles: {overflowed} ({pct:.2}%)"));
         }
         if cong.is_empty() {
             self.final_average_rc = 0.0;
@@ -511,19 +523,21 @@ impl RouteBase {
         let weighted = (f64::from(k[0]) * a005 + f64::from(k[1]) * a010 + f64::from(k[2]) * a020 + f64::from(k[3]) * a050) / f64::from(k[0] + k[1] + k[2] + k[3]);
         self.final_average_rc = weighted as f32;
         if verbose {
-            log.info("GPL", 43, format!("Average top 0.5% routing congestion: {a005:.4}"));
-            log.info("GPL", 44, format!("Average top 1.0% routing congestion: {a010:.4}"));
-            log.info("GPL", 45, format!("Average top 2.0% routing congestion: {a020:.4}"));
-            log.info("GPL", 46, format!("Average top 5.0% routing congestion: {a050:.4}"));
-            log.info("GPL", 47, format!("Routability iteration weighted routing congestion: {:.4}", self.final_average_rc));
+            let rc = self.final_average_rc;
+            log.debug("GPL", "routability", 1, || format!("Average top 0.5% routing congestion: {a005:.4}"));
+            log.debug("GPL", "routability", 1, || format!("Average top 1.0% routing congestion: {a010:.4}"));
+            log.debug("GPL", "routability", 1, || format!("Average top 2.0% routing congestion: {a020:.4}"));
+            log.debug("GPL", "routability", 1, || format!("Average top 5.0% routing congestion: {a050:.4}"));
+            log.debug("GPL", "routability", 1, || format!("Routability iteration weighted routing congestion: {rc:.4}"));
         }
     }
 
-    /// `RouteBase::routability`'s first half: the pass counted (GPL-0040) and the congestion
-    /// measured (`curRc`) — RUDY, or the global router's own.
+    /// `RouteBase::routability`'s first half: the pass counted (`increaseCounter`), the
+    /// congestion measured (`curRc`) — RUDY, or the global router's own — and the pass header
+    /// (GPL-0040, upstream `bbb676da997`): the pass, the congestion against its target, and the
+    /// actionable tiles overflowed (a tile counts once, whichever of its layers overflows).
     pub fn measure(&mut self, log: &mut Log, router: &mut dyn Router, locations: &[(usize, i32, i32)], std_centres: &[(i32, i32)]) -> Res<f32> {
         self.revert_count += 1;
-        log.info("GPL", 40, format!("Routability iteration: {}", self.revert_count));
         let cur_rc = if self.vars.use_rudy {
             self.calculate_rudy_tiles(log, router, locations, std_centres)?;
             self.update_rudy_average(log, true);
@@ -533,6 +547,9 @@ impl RouteBase {
             self.update_grt_route(log, &g, std_centres);
             self.grt_rc(log, &g)
         };
+        let (over, act) = (self.overflowed_tiles_count, self.actionable_tiles_count);
+        let pct = if act > 0 { over as f64 / act as f64 * 100.0 } else { 0.0 };
+        log.info("GPL", 40, format!("Routability pass {}: weighted congestion {:.4} (target {:.4}), {} of {} actionable tiles overflowed ({:.1}%).", self.revert_count, cur_rc, self.vars.target_rc, over, act, pct));
         Ok(cur_rc)
     }
 }
@@ -544,7 +561,7 @@ impl RouteBase {
     /// left, a vertical one the tile below.
     fn update_grt_route(&mut self, log: &mut Log, g: &GrtCongestion, std_centres: &[(i32, i32)]) {
         let num_layers = g.layers.len() as i32;
-        log.info("GPL", 39, format!("Number of routing layers: {num_layers}"));
+        log.debug("GPL", "routability", 1, || format!("Number of routing layers: {num_layers}"));
         self.cnt_x = g.cnt_x;
         self.cnt_y = g.cnt_y;
         self.size = g.tile_x;
@@ -588,10 +605,14 @@ impl RouteBase {
     /// `getGrtRC`: per actionable tile and every routing layer (0 outside the router's range), the
     /// usage ratio joins its direction's list; the top 0.5/1/2/5% means of each list, the larger
     /// direction's weighted (GPL-0064..0075).
-    fn grt_rc(&self, log: &mut Log, g: &GrtCongestion) -> f32 {
+    fn grt_rc(&mut self, log: &mut Log, g: &GrtCongestion) -> f32 {
         let (mut over_h, mut over_v, mut over_cnt) = (0.0f64, 0.0f64, 0i32);
         let (mut hor, mut ver): (Vec<f64>, Vec<f64>) = (vec![], vec![]);
+        // the pass header's tile counts: a tile is overflowed if any of its layers is
+        let (mut overflowed_tiles, mut actionable_tiles) = (0usize, 0usize);
         for t in self.tiles.iter().filter(|t| t.actionable) {
+            actionable_tiles += 1;
+            let mut tile_overflowed = false;
             for (k, l) in g.layers.iter().enumerate() {
                 let level = k as i32 + 1;
                 let mut ratio = usage_capacity_ratio(l, g.cnt_x, t.x, t.y, self.vars.ignore_edge_ratio);
@@ -608,29 +629,36 @@ impl RouteBase {
                     }
                     if ratio > 1.0 {
                         over_cnt += 1;
+                        tile_overflowed = true;
                     }
                 }
             }
+            if tile_overflowed {
+                overflowed_tiles += 1;
+            }
         }
-        log.info("GPL", 64, format!("TotalRouteOverflowH2: {over_h:.4}"));
-        log.info("GPL", 65, format!("TotalRouteOverflowV2: {over_v:.4}"));
-        log.info("GPL", 66, format!("OverflowTileCnt2: {over_cnt}"));
+        self.overflowed_tiles_count = overflowed_tiles;
+        self.actionable_tiles_count = actionable_tiles;
+        self.total_route_overflow = over_h + over_v;
+        log.debug("GPL", "routability", 1, || format!("TotalRouteOverflowH2: {over_h:.4}"));
+        log.debug("GPL", "routability", 1, || format!("TotalRouteOverflowV2: {over_v:.4}"));
+        log.debug("GPL", "routability", 1, || format!("OverflowTileCnt2: {over_cnt}"));
         hor.sort_by(|a, b| b.total_cmp(a));
         ver.sort_by(|a, b| b.total_cmp(a));
         let (h, v) = (top_averages(&hor), top_averages(&ver));
         // `std::fmax`: a NaN mean (an empty list) yields the other
         let m: Vec<f64> = (0..4).map(|i| h[i].max(v[i])).collect();
-        log.info("GPL", 67, format!("0.5%RC: {:.4}", m[0]));
-        log.info("GPL", 68, format!("1.0%RC: {:.4}", m[1]));
-        log.info("GPL", 69, format!("2.0%RC: {:.4}", m[2]));
-        log.info("GPL", 70, format!("5.0%RC: {:.4}", m[3]));
+        log.debug("GPL", "routability", 1, || format!("0.5%RC: {:.4}", m[0]));
+        log.debug("GPL", "routability", 1, || format!("1.0%RC: {:.4}", m[1]));
+        log.debug("GPL", "routability", 1, || format!("2.0%RC: {:.4}", m[2]));
+        log.debug("GPL", "routability", 1, || format!("5.0%RC: {:.4}", m[3]));
         let k = self.vars.rc_k;
-        log.info("GPL", 71, format!("0.5rcK: {:.2}", k[0]));
-        log.info("GPL", 72, format!("1.0rcK: {:.2}", k[1]));
-        log.info("GPL", 73, format!("2.0rcK: {:.2}", k[2]));
-        log.info("GPL", 74, format!("5.0rcK: {:.2}", k[3]));
+        log.debug("GPL", "routability", 1, || format!("0.5rcK: {:.2}", k[0]));
+        log.debug("GPL", "routability", 1, || format!("1.0rcK: {:.2}", k[1]));
+        log.debug("GPL", "routability", 1, || format!("2.0rcK: {:.2}", k[2]));
+        log.debug("GPL", "routability", 1, || format!("5.0rcK: {:.2}", k[3]));
         let rc = ((f64::from(k[0]) * m[0] + f64::from(k[1]) * m[1] + f64::from(k[2]) * m[2] + f64::from(k[3]) * m[3]) / f64::from(k[0] + k[1] + k[2] + k[3])) as f32;
-        log.info("GPL", 75, format!("Final routing congestion: {rc}"));
+        log.debug("GPL", "routability", 1, || format!("Final routing congestion: {rc}"));
         rc
     }
 }
