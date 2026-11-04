@@ -730,6 +730,9 @@ pub struct Nesterov {
     allow_divergence_recovery: bool,
     /// `incremental_penalty_guard_requested_`: the next loop runs the density-penalty guard.
     incremental_penalty_guard_requested: bool,
+    /// `reset_nesterov_momentum_`: a timing-driven pass changed the netlist; the next iteration
+    /// starts its momentum again.
+    reset_nesterov_momentum: bool,
     /// `is_routability_need_`.
     routability_need: bool,
     /// `minRcCellSize_`: each standard instance cell's size at the minimum congestion so far.
@@ -869,6 +872,7 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         diverge: None,
         allow_divergence_recovery: false,
         incremental_penalty_guard_requested: false,
+        reset_nesterov_momentum: false,
         routability_need: true,
         min_rc_cell_size: vec![],
         port_gpin: std::collections::HashMap::new(),
@@ -3016,9 +3020,10 @@ impl Nesterov {
     }
 
     /// `NesterovBase::updateGCellState` for each new cell of region `b`: its pins at the
-    /// database's terminals, its density size, inside the bins, every slot at its density centre,
-    /// its current gradient, a step back along it (kept inside) as its previous point — the cell
-    /// moved there — and its previous gradient.
+    /// database's terminals, its density size, inside the bins, and its slots (current, look-ahead,
+    /// previous) at its density centre. Its gradients are left to `refreshCurGradients`, once the
+    /// whole repair has landed (upstream: the prev slot needs no seeding, `updateNextIter` rotates
+    /// it out before it is read).
     fn update_gcell_state(&mut self, b: usize, cells: &[usize]) {
         for &gi in cells {
             let Some(i) = self.nbs[b].cells.iter().position(|&x| x == gi) else { continue };
@@ -3038,44 +3043,22 @@ impl Nesterov {
                 nb.prev_slp[i] = pt;
                 nb.cur[i] = pt;
             }
-            let (wl, den, sum) = self.single_gradient(b, i);
-            {
-                let nb = &mut self.nbs[b];
-                nb.cur_slp_wl[i] = wl;
-                nb.cur_slp_den[i] = den;
-                nb.cur_slp_sum[i] = sum;
-            }
-            let c = self.initial_prev_coordi_update_coef;
-            let px = self.nbs[b].cur_slp[i].x - c * self.nbs[b].cur_slp_sum[i].x;
-            let py = self.nbs[b].cur_slp[i].y - c * self.nbs[b].cur_slp_sum[i].y;
-            let q = FloatPoint::new(self.inside_x(b, i, px), self.inside_y(b, i, py));
-            self.nbs[b].prev_slp[i] = q;
-            self.set_density_center(b, i, q.x as i32, q.y as i32);
-            let (wl, den, sum) = self.single_gradient(b, i);
-            let nb = &mut self.nbs[b];
-            nb.prev_slp_wl[i] = wl;
-            nb.prev_slp_den[i] = den;
-            nb.prev_slp_sum[i] = sum;
         }
     }
 
-    /// `updateSingleGradient`: one cell's WA gradient (from the forces as the last iteration
-    /// left them), density gradient, and their preconditioned sum — zero for a locked cell.
-    fn single_gradient(&self, b: usize, i: usize) -> (FloatPoint, FloatPoint, FloatPoint) {
-        let gi = self.nbs[b].cells[i];
-        let g = &self.gcells[gi];
-        if g.locked {
-            return (FloatPoint::default(), FloatPoint::default(), FloatPoint::default());
+    /// `refreshCurGradients` (upstream after a non-virtual timing-driven pass): every gradient at
+    /// the look-ahead point on the repaired netlist, in `init`'s order — each region's density
+    /// centres there and its field, the WA forces, then each region's current gradients.
+    fn refresh_cur_gradients(&mut self) {
+        for b in 0..self.nbs.len() {
+            let c = self.nbs[b].cur_slp.clone();
+            self.update_gcell_density_center_location(b, &c);
+            self.update_density_field_bin(b);
         }
-        let wl = self.wl_gradient(gi, &self.pin_net);
-        let den = self.density_gradient(b, i);
-        let p = self.nbs[b].density_penalty;
-        let mut sum = FloatPoint::new(wl.x + p * den.x, wl.y + p * den.y);
-        let wl_pre = g.pins.len() as f32;
-        let area = g.dx() as f32 * g.dy() as f32;
-        sum.x /= (wl_pre + p * area).max(MIN_PRECONDITIONER);
-        sum.y /= (wl_pre + p * area).max(MIN_PRECONDITIONER);
-        (wl, den, sum)
+        self.update_wirelength_force_wa();
+        for b in 0..self.nbs.len() {
+            self.np_update_gradient(b, Slot::Cur);
+        }
     }
 
     /// `executeTimingDriven`'s weights: the worst nets (by slack, ties by block order), the worst
@@ -3139,7 +3122,8 @@ impl Nesterov {
         let hpwl = self.hpwl();
         log.info("GPL", 101, format!("   Iter: {}, overflow: {:.3}, keep resizer changes at: {}, HPWL: {}", iter + 1, self.average_overflow_unscaled, crate::timing_driven::fmt_float(td.state.keep_resize_below_overflow), hpwl));
         let nbc_before = self.gcells.iter().filter(|g| g.is_instance()).count() as i32;
-        let nb_before: usize = self.nbs.iter().map(|nb| nb.cells.len()).sum();
+        // the regions' INSTANCE cells (fillers and IO pins are not the repair's)
+        let nb_before: usize = self.nbs.iter().map(|nb| nb.cells.iter().filter(|&&gi| self.gcells[gi].is_instance()).count()).sum();
         let repair = td.state.counter == td.state.overflows.len() as i32 && td.state.repair_timing;
         let locations = placed_locations(td.common, self);
         let report = td.router.find_resize_slacks(log, &locations, repair, td.state.repair_tns_end_percent)?;
@@ -3154,7 +3138,7 @@ impl Nesterov {
         *td_count += 1;
         let nbc_delta = absorbed.created - absorbed.deleted;
         *td_delta += absorbed.delta_area;
-        let nb_after: usize = self.nbs.iter().map(|nb| nb.cells.len()).sum();
+        let nb_after: usize = self.nbs.iter().map(|nb| nb.cells.iter().filter(|&&gi| self.gcells[gi].is_instance()).count()).sum();
         let nb_delta = nb_after as i32 - nb_before as i32;
         if nb_delta != nbc_delta {
             log.warn("GPL", 92, format!("Mismatch in #cells between central object and all regions. NesterovBaseCommon: {nbc_delta}, Summing all regions: {nb_delta}"));
@@ -3181,6 +3165,7 @@ impl Nesterov {
             self.update_areas(b);
             update_density_size(&mut self.gcells, &self.nbs[b]);
         }
+        self.refresh_cur_gradients();
         let hpwl = self.hpwl();
         if f64::from(self.average_overflow_unscaled) <= 0.25 {
             self.min_hpwl = hpwl;
@@ -3188,6 +3173,8 @@ impl Nesterov {
             self.diverge_snapshot_iter = iter + 1;
             self.is_min_hpwl = true;
         }
+        // the next iteration restarts the momentum (GPL-0111, upstream af3dfe97f09)
+        self.reset_nesterov_momentum = true;
         if !proceed {
             td.state.enabled = false;
         }
@@ -3838,6 +3825,11 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
     let mut cur_a = 1.0f32;
     let mut iter = start_iter;
     while iter < np.max_iter {
+        if np.reset_nesterov_momentum {
+            cur_a = 1.0;
+            np.reset_nesterov_momentum = false;
+            log.info("GPL", 111, "Timing-driven: restarting Nesterov momentum.");
+        }
         let prev_a = cur_a;
         cur_a = ((1.0 + (4.0 * f64::from(prev_a) * f64::from(prev_a) + 1.0).sqrt()) * 0.5) as f32;
         let coeff = ((f64::from(prev_a) - 1.0) / f64::from(cur_a)) as f32;
