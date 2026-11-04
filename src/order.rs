@@ -342,9 +342,142 @@ impl<T: Clone, F: FnMut(&T, &T) -> bool> Sorter<'_, T, F> {
     }
 }
 
+/// libc++'s `std::partial_sort(first, middle, last, comp)` (`__partial_sort_impl`): `make_heap`
+/// over the first `mid`, each later element that ranks before the heap's top swapped in and
+/// sifted down, then `sort_heap`. Which of equal keys end up in front is fixed by these moves
+/// alone. `less(a, b)`: `a` ranks before `b`.
+pub fn libcxx_partial_sort_by<T: Clone>(v: &mut [T], mid: usize, mut less: impl FnMut(&T, &T) -> bool) {
+    if mid == 0 {
+        return;
+    }
+    // `__make_heap`
+    if mid > 1 {
+        let mut start = (mid - 2) / 2;
+        loop {
+            heap_sift_down(v, &mut less, mid, start);
+            if start == 0 {
+                break;
+            }
+            start -= 1;
+        }
+    }
+    for i in mid..v.len() {
+        if less(&v[i], &v[0]) {
+            v.swap(i, 0);
+            heap_sift_down(v, &mut less, mid, 0);
+        }
+    }
+    // `__sort_heap`
+    let mut n = mid;
+    while n > 1 {
+        heap_pop(v, &mut less, n);
+        n -= 1;
+    }
+}
+
+/// libc++ `__sift_down(first, comp, len, start)`.
+fn heap_sift_down<T: Clone>(v: &mut [T], less: &mut impl FnMut(&T, &T) -> bool, len: usize, mut start: usize) {
+    let mut child = start;
+    if len < 2 || (len - 2) / 2 < child {
+        return;
+    }
+    child = 2 * child + 1;
+    if child + 1 < len && less(&v[child], &v[child + 1]) {
+        child += 1;
+    }
+    if less(&v[child], &v[start]) {
+        return;
+    }
+    let top = v[start].clone();
+    loop {
+        v[start] = v[child].clone();
+        start = child;
+        if (len - 2) / 2 < child {
+            break;
+        }
+        child = 2 * child + 1;
+        if child + 1 < len && less(&v[child], &v[child + 1]) {
+            child += 1;
+        }
+        if less(&v[child], &top) {
+            break;
+        }
+    }
+    v[start] = top;
+}
+
+/// libc++ `__pop_heap(first, last, comp, len)`: Floyd's descent of the hole to a leaf, the last
+/// element dropped in and sifted up.
+fn heap_pop<T: Clone>(v: &mut [T], less: &mut impl FnMut(&T, &T) -> bool, len: usize) {
+    if len <= 1 {
+        return;
+    }
+    let top = v[0].clone();
+    // `__floyd_sift_down`
+    let mut hole = 0usize;
+    loop {
+        // the libc++ pointer walk `child_i += child + 1; child = 2 * child + 1`
+        let mut child = 2 * hole + 1;
+        if child + 1 < len && less(&v[child], &v[child + 1]) {
+            child += 1;
+        }
+        v[hole] = v[child].clone();
+        hole = child;
+        if child > (len - 2) / 2 {
+            break;
+        }
+    }
+    let last = len - 1;
+    if hole == last {
+        v[hole] = top;
+    } else {
+        v[hole] = v[last].clone();
+        v[last] = top;
+        // `__sift_up(first, hole + 1, comp, hole + 1 - first)`
+        let mut n = hole + 1;
+        if n > 1 {
+            n = (n - 2) / 2;
+            let mut l = hole;
+            if less(&v[n], &v[l]) {
+                let t = v[l].clone();
+                loop {
+                    v[l] = v[n].clone();
+                    l = n;
+                    if n == 0 {
+                        break;
+                    }
+                    n = (n - 1) / 2;
+                    if !less(&v[n], &t) {
+                        break;
+                    }
+                }
+                v[l] = t;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (libc++ `std::partial_sort`: make_heap over the front, a strictly earlier element
+    // swapped into the top and sifted down, then sort_heap; upstream gpl 83f93bdef69 hands the
+    // leftover fillers to the bins it puts first). Equal remainders: the whole permutation as
+    // libc++ itself printed it (clang -stdlib=libc++).
+    #[test]
+    fn partial_sort_moves_ties_as_libcxx_does() {
+        let r = [0.5, 0.5, 0.25, 0.5, 0.75, 0.5, 0.25, 0.5, 0.5, 0.75, 0.5];
+        let run = |mid: usize| {
+            let mut o: Vec<usize> = (0..r.len()).collect();
+            libcxx_partial_sort_by(&mut o, mid, |&a, &b| r[a] > r[b]);
+            o
+        };
+        assert_eq!(run(1), vec![4, 1, 2, 3, 0, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(run(3), vec![9, 4, 0, 2, 1, 5, 6, 7, 8, 3, 10]);
+        assert_eq!(run(5), vec![4, 9, 0, 5, 1, 2, 6, 7, 8, 3, 10]);
+        assert_eq!(run(8), vec![4, 9, 5, 8, 0, 1, 3, 7, 6, 2, 10]);
+    }
 
     // Rule (libc++ __introsort): below 24 elements equal keys keep input order; above, the
     // partition moves them. The 30-element

@@ -22,7 +22,7 @@
 
 use crate::ld::{self, Ld};
 use crate::log::{refuse, Log, Res};
-use crate::normal::{normal, Mt19937};
+use crate::normal::{normal, uniform_int, Mt19937};
 use crate::ooura;
 use crate::placer_base::{Base, Common, Design};
 use crate::initial_place::Ip;
@@ -521,6 +521,9 @@ pub struct Nb {
     reprint_header: bool,
     is_converged: bool,
     is_diverged: bool,
+    /// `generator_`: the region's own mt19937 (seed `initialPlacePerturbationSeed`), drawn first by
+    /// the constructor's perturbation, then by `redistributeFillerCells`.
+    generator: Mt19937,
 }
 
 impl Nb {
@@ -679,6 +682,7 @@ impl Nb {
             reprint_header: false,
             is_converged: false,
             is_diverged: false,
+            generator: Mt19937::new(o.seed as u32),
         }
     }
 }
@@ -899,7 +903,7 @@ fn nesterov_base(log: &mut Log, d: &Design, c: &mut Common, ip: &mut Ip, base: &
     log.info("GPL", 33, format!("---- Initialize Nesterov Region: {}", group.as_deref().unwrap_or("Top-level")));
     let mut nb = Nb::new(base, group, &np.o);
     let fillers = init_filler_gcells(log, d, c, base, &mut nb, &np.o)?;
-    perturb_place_insts(d, c, ip, base, inst_cell, &mut np.gcells, &np.o);
+    perturb_place_insts(d, c, ip, base, inst_cell, &mut np.gcells, &np.o, &mut nb.generator);
     nb.fillers = fillers.len();
     // a cluster is added where its first instance comes in the region's order
     nb.cells = base.place_insts.iter().filter_map(|&k| {
@@ -1321,16 +1325,15 @@ fn init_filler_gcells(log: &mut Log, d: &Design, c: &Common, base: &Base, nb: &m
 /// σ = 0.3072 · r, r the given distance (scaled by DBU/1000) or min(half a micron, a row); each
 /// rounded; the instance and its pins moved, its cell rebuilt. A distance of exactly 0, or no row
 /// height, draws nothing.
-fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, inst_cell: &[Option<usize>], gcells: &mut [GCell], o: &Opts) {
+fn perturb_place_insts(d: &Design, c: &mut Common, ip: &mut Ip, base: &Base, inst_cell: &[Option<usize>], gcells: &mut [GCell], o: &Opts, rng: &mut Mt19937) {
     let dist = o.perturb_dist;
     let draws = c.site_y > 0 && dist != 0.0;
     let r = if dist > 0.0 { f64::from(dist) * (f64::from(d.dbu) / 1000.0) } else { (0.5 * f64::from(d.dbu)).min(f64::from(c.site_y)) };
     let sigma = r * 0.3071963263271184;
-    let mut rng = Mt19937::new(o.seed as u32);
     for &k in &base.place_insts {
         let (xo, yo) = if draws {
-            let dx = normal(&mut rng, 0.0, sigma);
-            let dy = normal(&mut rng, 0.0, sigma);
+            let dx = normal(rng, 0.0, sigma);
+            let dy = normal(rng, 0.0, sigma);
             (dx.round() as i32, dy.round() as i32)
         } else {
             (0, 0)
@@ -3552,10 +3555,127 @@ pub fn placed_locations(c: &Common, nb: &Nesterov) -> Vec<(usize, i32, i32)> {
 /// final iteration.
 pub fn do_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, route: Option<&mut Routability<'_>>, td: Option<&mut TimingDriven<'_>>) -> Res<i32> {
     // `NesterovPlaceVars`: the reference HPWL, from the design's own (initial) HPWL when unset.
+    init_nesterov_loop(log, np)?;
+    resume_nesterov_place(log, d, np, 0, route, td)
+}
+
+/// What `initNesterovPlace` does to a new placer before its loop: the reference HPWL, from the
+/// design's own (initial) HPWL when unset (`NesterovPlaceVars`), then `NesterovPlace::init`.
+pub fn init_nesterov_loop(log: &mut Log, np: &mut Nesterov) -> Res<()> {
     let design_hpwl = np.hpwl();
     np.reference_hpwl = derived_reference_hpwl(np.o.reference_hpwl, design_hpwl);
-    np.np_init(log)?;
-    resume_nesterov_place(log, d, np, 0, route, td)
+    np.np_init(log)
+}
+
+/// `Replace::doNesterovPlace` on a placer `initNesterovPlace` already built and initialised: the
+/// loop from iteration 0.
+pub fn run_nesterov_loop(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<i32> {
+    resume_nesterov_place(log, d, np, 0, None, None)
+}
+
+impl Nesterov {
+    /// `NesterovBase::redistributeFillerCells` for region `b` (incremental placement, before its
+    /// first pass): each bin's free capacity (its target share of the area less its placed and
+    /// fixed area, at least 0), summed in bin order; GPL-0332 and nothing moved when that is not
+    /// positive or short of the fillers' area. Otherwise every bin gets a whole number of fillers
+    /// in proportion (largest remainder: the leftover goes to the bins libc++'s `partial_sort`
+    /// puts first by remainder), and the fillers, in the region's order, fill the bins in order —
+    /// each at its bin's centre jittered by up to half the bin less half the cell (a boost
+    /// `uniform_int` draw from the region's generator per axis, only when that range is
+    /// positive), every coordinate set there and its gradients zeroed. Then the density centres,
+    /// the field, and GPL-0333.
+    pub fn redistribute_filler_cells(&mut self, log: &mut Log, b: usize) {
+        if self.nbs[b].fillers == 0 {
+            return;
+        }
+        let nb = &self.nbs[b];
+        let bins = &nb.bg.bins;
+        let mut free_capacity = vec![0.0f64; bins.len()];
+        let mut total_free_capacity = 0.0f64;
+        for (k, bin) in bins.iter().enumerate() {
+            let scaled_bin_area = bin.area() as f64 * f64::from(bin.target_density);
+            let free = scaled_bin_area - bin.inst_placed as f64 - bin.non_place as f64;
+            free_capacity[k] = free.max(0.0);
+            total_free_capacity += free_capacity[k];
+        }
+        let num_fillers = nb.fillers;
+        let dbu2 = f64::from(nb.dbu) * f64::from(nb.dbu);
+        let free_capacity_um2 = (total_free_capacity as i64) as f64 / dbu2;
+        let filler_area_um2 = nb.total_filler_area as f64 / dbu2;
+        if total_free_capacity <= 0.0 || total_free_capacity < nb.total_filler_area as f64 {
+            log.warn("GPL", 332, format!("Not enough free bin capacity ({free_capacity_um2:.3} um^2) to redistribute {num_fillers} filler cells ({filler_area_um2:.3} um^2); leaving filler positions unchanged."));
+            return;
+        }
+        let mut quota = vec![0usize; bins.len()];
+        let mut remainder = vec![0.0f64; bins.len()];
+        let mut assigned = 0usize;
+        for k in 0..bins.len() {
+            let exact = free_capacity[k] / total_free_capacity * num_fillers as f64;
+            quota[k] = exact as usize;
+            remainder[k] = exact - quota[k] as f64;
+            assigned += quota[k];
+        }
+        let assigned = assigned.min(num_fillers);
+        let leftover = num_fillers - assigned;
+        if leftover > 0 {
+            let mut order: Vec<usize> = (0..bins.len()).collect();
+            crate::order::libcxx_partial_sort_by(&mut order, leftover, |&x, &y| remainder[x] > remainder[y]);
+            for &k in &order[..leftover] {
+                quota[k] += 1;
+            }
+        }
+        let n_bins = bins.len();
+        let mut bin_idx = 0usize;
+        let mut remaining_in_bin = quota[0];
+        let mut repositioned = 0usize;
+        for i in 0..self.nbs[b].cells.len() {
+            let gi = self.nbs[b].cells[i];
+            if !self.gcells[gi].is_filler() {
+                continue;
+            }
+            while remaining_in_bin == 0 && bin_idx + 1 < n_bins {
+                bin_idx += 1;
+                remaining_in_bin = quota[bin_idx];
+            }
+            if remaining_in_bin == 0 {
+                break;
+            }
+            let nb = &mut self.nbs[b];
+            let bin = &nb.bg.bins[bin_idx];
+            let (bcx, bcy) = ((bin.ux + bin.lx) / 2, (bin.uy + bin.ly) / 2);
+            let (bdx, bdy) = (bin.ux - bin.lx, bin.uy - bin.ly);
+            let g = &mut self.gcells[gi];
+            let half_dx = (g.ux - g.lx) / 2;
+            let half_dy = (g.uy - g.ly) / 2;
+            let range_x = (bdx / 2 - half_dx).max(0);
+            let range_y = (bdy / 2 - half_dy).max(0);
+            let jitter_x = if range_x > 0 { uniform_int(&mut nb.generator, -range_x, range_x) } else { 0 };
+            let jitter_y = if range_y > 0 { uniform_int(&mut nb.generator, -range_y, range_y) } else { 0 };
+            let (cx, cy) = (bcx + jitter_x, bcy + jitter_y);
+            // `GCell::setCenterLocation`: the box only (a filler has no pins)
+            g.lx = cx - half_dx;
+            g.ly = cy - half_dy;
+            g.ux = cx + half_dx;
+            g.uy = cy + half_dy;
+            let pos = FloatPoint { x: cx as f32, y: cy as f32 };
+            nb.cur[i] = pos;
+            nb.cur_slp[i] = pos;
+            nb.prev_slp[i] = pos;
+            nb.next[i] = pos;
+            nb.next_slp[i] = pos;
+            nb.snapshot[i] = pos;
+            nb.snapshot_slp[i] = pos;
+            nb.cur_slp_wl[i] = FloatPoint::default();
+            nb.cur_slp_den[i] = FloatPoint::default();
+            nb.cur_slp_sum[i] = FloatPoint::default();
+            remaining_in_bin -= 1;
+            repositioned += 1;
+        }
+        let cur = self.nbs[b].cur.clone();
+        self.update_gcell_density_center_location(b, &cur);
+        self.update_density_field_bin(b);
+        log.info("GPL", 333, format!("Redistributed {repositioned} filler cells into free bin capacity ({free_capacity_um2:.3} um^2 available, {filler_area_um2:.3} um^2 needed)."));
+    }
 }
 
 /// `Replace::doNesterovPlace` again on the placer that already exists (`initNesterovPlace` finds

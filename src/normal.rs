@@ -95,6 +95,37 @@ impl Mt19937 {
     }
 }
 
+impl std::fmt::Debug for Mt19937 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mt19937 {{ i: {} }}", self.i)
+    }
+}
+
+/// One draw of a freshly constructed `boost::random::uniform_int_distribution<int>(min, max)`
+/// from `eng` (`generate_uniform_int`, the engine's range 2^32 − 1 wider than the asked one):
+/// the engine's output split into `range + 1` equal buckets (one more per bucket when the
+/// division leaves exactly `range` over), redrawn while it lands past the last.
+pub fn uniform_int(eng: &mut Mt19937, min: i32, max: i32) -> i32 {
+    let range = (i64::from(max) - i64::from(min)) as u32;
+    if range == 0 {
+        return min;
+    }
+    let brange = u32::MAX;
+    if range == brange {
+        return (i64::from(min) + i64::from(eng.next_u32())) as i32;
+    }
+    let mut bucket = brange / (range + 1);
+    if brange % (range + 1) == range {
+        bucket += 1;
+    }
+    loop {
+        let r = eng.next_u32() / bucket;
+        if r <= range {
+            return (i64::from(min) + i64::from(r)) as i32;
+        }
+    }
+}
+
 /// One draw of a freshly constructed `normal_distribution<double>(mean, sigma)` from `eng`:
 /// the unit normal scaled by `sigma`, then shifted by `mean`, in that order.
 pub fn normal(eng: &mut Mt19937, mean: f64, sigma: f64) -> f64 {
@@ -397,6 +428,19 @@ const EXP_Y: [f64; 257] = [
 
 #[cfg(test)]
 mod tests {
+    // Rule (boost `generate_uniform_int`, the redistributed fillers' jitter, upstream gpl
+    // 83f93bdef69): buckets of 2^32 − 1 / (range + 1), one wider when the division leaves exactly
+    // `range` over, redrawn past the last. Draws as boost printed them from `mt19937(42)`.
+    #[test]
+    fn uniform_int_draws_as_boost_does() {
+        let mut eng = Mt19937::new(42);
+        let mut draws = |r: i32| -> Vec<i32> { (0..5).map(|_| uniform_int(&mut eng, -r, r)).collect() };
+        assert_eq!(draws(1), vec![0, 1, 1, -1, 1]);
+        assert_eq!(draws(7), vec![4, 1, 1, -5, -1]);
+        assert_eq!(draws(1000), vec![-688, -800, -884, -82, 733]);
+        assert_eq!(draws(123457), vec![-41057, 24971, -88180, 51381, 37261]);
+    }
+
     use super::*;
 
     const SIGMA: f64 = 0.3071963263271184 * 100.0;

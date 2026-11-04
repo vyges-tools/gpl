@@ -341,7 +341,13 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     check_place_ios_supported(log, d, v)?;
     let mut ip = initial_place::do_bicgstab_place(log, d, &mut common, v, ipv);
     let mut np = nesterov::init_nesterov_place(log, d, &mut common, &mut ip, &bases, &locked)?;
-    let mut iter = nesterov::do_nesterov_place(log, d, &mut np, None, None)?;
+    // The placer built (and initialised) before its first pass, so the fillers can be
+    // redistributed first (upstream 83f93bdef69).
+    nesterov::init_nesterov_loop(log, &mut np)?;
+    for b in 0..np.nbs.len() {
+        np.redistribute_filler_cells(log, b);
+    }
+    let mut iter = nesterov::run_nesterov_loop(log, d, &mut np)?;
     // `updateDb` then `reportHpwlMetric` at the end of this pass
     let Some(router) = router else { return refuse("-incremental needs the design database to write between its passes") };
     router.write_locations(log, &nesterov::placed_locations(&common, &np))?;
