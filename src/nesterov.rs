@@ -3070,13 +3070,17 @@ impl Nesterov {
             log.warn("GPL", 105, "Timing-driven: no net slacks found. Timing-driven mode disabled.");
             return false;
         }
-        let slack_min = slacks[worst[0]].1;
+        // the ramp runs from the anchor's slack up to the best slack still in the worst set
+        let anchor = crate::timing_driven::slack_ramp_anchor_index(worst.len(), st.nets_percentage);
+        let worst_slack = slacks[worst[0]].1;
+        let slack_min = slacks[worst[anchor]].1;
         let slack_max = slacks[*worst.last().expect("a worst net")].1;
-        log.info("GPL", 106, format!("Timing-driven: worst slack {}", crate::timing_driven::fmt_float(slack_min)));
-        if slack_min >= 1e30f32 * 0.999 {
+        if worst_slack >= 1e30f32 * 0.999 {
             log.warn("GPL", 102, "Timing-driven: no slacks found. Timing-driven mode disabled.");
             return false;
         }
+        log.info("GPL", 106, format!("Timing-driven: worst slack {}", crate::timing_driven::fmt_float(worst_slack)));
+        log.debug("GPL", "timing", 1, || format!("Timing-driven: weight ramp {} to {}, anchored on net {} of {}.", crate::timing_driven::fmt_float(slack_min), crate::timing_driven::fmt_float(slack_max), anchor + 1, worst.len()));
         let by_name: HashMap<&str, f32> = slacks.iter().map(|(n, s)| (n.as_str(), *s)).collect();
         let mut weighted = 0;
         for (g, gnet) in self.gnets.iter_mut().enumerate() {
@@ -3084,8 +3088,8 @@ impl Nesterov {
             if gnet.pins.len() > 1 {
                 let name = design.nets[c.nets[g].0].name.as_str();
                 let Some(&s) = by_name.get(name) else { continue };
-                if let Some(w) = crate::timing_driven::timing_weight(s, slack_min, slack_max, st.net_weight_max) {
-                    gnet.timing_weight = w;
+                if s < slack_max {
+                    gnet.timing_weight = crate::timing_driven::compute_timing_net_weight(s, slack_min, slack_max, st.net_weight_max);
                     weighted += 1;
                 }
                 let total = gnet.total_weight();

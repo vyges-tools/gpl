@@ -89,13 +89,31 @@ pub fn worst_slack_nets(slacks: &[(String, f32)], percent: f32) -> Vec<usize> {
     idx
 }
 
-/// `weight(slack)` of `executeTimingDriven`: from 1 at the worst set's best slack up to the
-/// maximum at its worst (1 when they are equal), for a net strictly below that best slack.
-pub fn timing_weight(slack: f32, slack_min: f32, slack_max: f32, net_weight_max: f32) -> Option<f32> {
-    if slack >= slack_max {
-        return None;
+/// `kSlackMinPercent`: the weight ramp's worst end sits this percentage of the whole design's
+/// constrained nets in from the worst net.
+pub const SLACK_MIN_PERCENT: f64 = 0.2;
+
+/// `slackRampAnchorIndex` (upstream 1ec9452b345): the index in the worst set (sorted by
+/// increasing slack) whose slack anchors the ramp's worst end. The worst set holds
+/// `nets_percentage` % of the nets, so the anchor is a fixed share of the design however large
+/// that set is; a small design anchors on its worst net. Never past the set's last net.
+pub fn slack_ramp_anchor_index(net_count: usize, nets_percentage: f32) -> usize {
+    if nets_percentage <= 0.0 {
+        return 0;
     }
-    Some(if slack_max == slack_min { 1.0 } else { 1.0 + (net_weight_max - 1.0) * (slack_max - slack) / (slack_max - slack_min) })
+    let anchor = (net_count as f64 * SLACK_MIN_PERCENT / f64::from(nets_percentage)) as usize;
+    (net_count - 1).min(anchor)
+}
+
+/// `computeTimingNetWeight`: 1 plus the extra weight times the net's criticality — where its
+/// slack sits between the ramp's best end (0) and its worst end (1), clamped to that range, so
+/// a net worse than the anchor saturates. A flat or inverted ramp weighs every net 1.
+pub fn compute_timing_net_weight(net_slack: f32, slack_min: f32, slack_max: f32, net_weight_max: f32) -> f32 {
+    if slack_max <= slack_min {
+        return 1.0;
+    }
+    let criticality = ((slack_max - net_slack) / (slack_max - slack_min)).clamp(0.0, 1.0);
+    1.0 + (net_weight_max - 1.0) * criticality
 }
 
 /// fmt's `{}` for a float: the shortest form, an exponent from 1e16 or below 1e-4.
@@ -113,6 +131,43 @@ pub fn fmt_float(v: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // upstream src/gpl/test/timing_base_test.cpp, the same cases
+
+    fn worst_count(total: usize, pct: f32) -> usize {
+        total.min((total as f64 * f64::from(pct) / 100.0).ceil() as usize)
+    }
+
+    #[test]
+    fn ramp_anchor_is_a_share_of_the_design() {
+        for pct in [10.0f32, 20.0, 25.0, 50.0, 70.0, 100.0] {
+            assert_eq!(slack_ramp_anchor_index(worst_count(150_000, pct), pct), 300, "nets_percentage {pct}");
+        }
+        assert_eq!(slack_ramp_anchor_index(150_000, 100.0), 300);
+        assert_eq!(slack_ramp_anchor_index(50_000, 50.0), 200);
+        assert_eq!(slack_ramp_anchor_index(1, 100.0), 0);
+        assert_eq!(slack_ramp_anchor_index(284, 100.0), 0);
+        assert_eq!(slack_ramp_anchor_index(29, 10.0), 0);
+        assert_eq!(slack_ramp_anchor_index(1000, 0.0), 0);
+        for n in 1..=1000 {
+            for pct in [0.1f32, 1.0, 10.0, 100.0] {
+                assert!(slack_ramp_anchor_index(n, pct) < n, "net_count {n} nets_percentage {pct}");
+            }
+        }
+    }
+
+    #[test]
+    fn net_weight_ramps_and_saturates() {
+        let w = |s| compute_timing_net_weight(s, -1.0, 1.0, 5.0);
+        for (s, e) in [(-1.0, 5.0), (1.0, 1.0), (0.0, 3.0), (0.5, 2.0), (-2.0, 5.0), (-100.0, 5.0), (2.0, 1.0)] {
+            assert!((w(s) - e).abs() < 1e-5, "slack {s}");
+        }
+        assert_eq!(compute_timing_net_weight(1.0, 1.0, 1.0, 5.0), 1.0);
+        // the criticality is divided out BEFORE it scales: (4 * 1/3) is not 4/3 in f32 for
+        // every operand, and the reference rounds this way
+        let c = (1.0f32 - 0.3) / (1.0 + 0.7);
+        assert_eq!(compute_timing_net_weight(0.3, -0.7, 1.0, 5.0).to_bits(), (1.0 + 4.0 * c).to_bits());
+    }
 
     /// Rule (`isTimingNetWeightOverflow`): a percent above the first overflow never fires; one
     /// below fires every overflow above it at once, once each.
