@@ -234,7 +234,24 @@ impl Router for DbRouter<'_> {
         if design.nets.len() != net_ids_after.len() {
             return refuse("the design's nets are not the block's: net ids unaligned");
         }
-        Ok(crate::timing_driven::ResizeReport { lines, events, net_ids_before, net_ids_after, slacks, design })
+        let mut event_masters = std::collections::HashMap::new();
+        for ev in &events {
+            let f: Vec<&str> = ev.split('|').collect();
+            let master = match f.as_slice() {
+                ["inst_create", _, m, ..] | ["swap_before", _, _, m, ..] => *m,
+                _ => continue,
+            };
+            if !event_masters.contains_key(master) {
+                let m = crate::timing_driven::EventMaster {
+                    width: self.db.master_get_width(master) as i32,
+                    height: self.db.master_get_height(master) as i32,
+                    core_auto_placeable: self.db.master_is_core_auto_placeable(master),
+                    is_block: self.db.master_is_block(master),
+                };
+                event_masters.insert(master.to_string(), m);
+            }
+        }
+        Ok(crate::timing_driven::ResizeReport { lines, events, net_ids_before, net_ids_after, slacks, design, event_masters })
     }
 
     /// `Rudy::Rudy` on an uninitialized router: `getMinMaxLayer`, `initFastRoute(min, max, false)`

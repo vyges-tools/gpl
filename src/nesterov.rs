@@ -3108,6 +3108,25 @@ pub struct TimingDriven<'a> {
     pub pad_right: i32,
 }
 
+/// `NesterovBaseCommon::createCbkGCell` for an instance the resizer creates and removes again in
+/// the same call (`inDbInstCreate` … `inDbInstDestroy`; repair_design's `fanout1` that
+/// `fullyRebuffer` then removes): the callback still makes its cell — `Instance(db_inst)` at
+/// creation, an unplaced instance at the origin, padded since it is not fixed (`copyDbLocation`),
+/// its area on `delta_area_`, the gcell appended to its region with every per-cell vector — and
+/// `destroyCbkGCell` swap-pops it again, so it moves the cells after it and counts in GPL-0109's
+/// created and deleted. Returns the padded instance and the cell's box once the resizer has
+/// placed it (`moveGCell`: the database box, unpadded); `None` for a macro (`getType().isBlock()`,
+/// or more than six rows tall).
+/// The database instance is gone, so the cell's instance names none.
+fn create_cbk_gcell_gone(m: &crate::timing_driven::EventMaster, pad_left: i32, pad_right: i32, site_x: i32, site_y: i32) -> Option<(crate::placer_base::Instance, crate::placer_base::Rect)> {
+    const ROW_LIMIT: i32 = 6;
+    if m.is_block || m.height > ROW_LIMIT * site_y {
+        return None;
+    }
+    let inst = crate::placer_base::Instance { db: None, lx: -pad_left * site_x, ly: 0, ux: m.width + pad_right * site_x, uy: m.height, fixed: false, macro_: false, locked: false };
+    Some((inst, crate::placer_base::Rect { lx: 0, ly: 0, ux: m.width, uy: m.height }))
+}
+
 /// What a netlist edit added: each new instance cell and the region it joins; the cells created
 /// and deleted; the area they added (`delta_area_`).
 struct Absorbed {
@@ -3164,36 +3183,55 @@ impl Nesterov {
         let new_net_of_id: HashMap<u32, usize> = report.net_ids_after.iter().enumerate().map(|(k, &id)| (id, k)).collect();
         let event_id = |f: &[&str]| f.last().and_then(|x| x.parse::<u32>().ok());
         let mut created: Vec<(String, usize)> = Vec::new();
+        // the instances created in this call that are gone by its end, by their current master
+        let mut gone_master: HashMap<String, String> = HashMap::new();
         for ev in events {
             let f: Vec<&str> = ev.split('|').collect();
             match f.as_slice() {
                 ["inst_create", name, ..] => {
-                    let Some(&k) = new_ix.get(name) else { return refuse(format!("{name}: an instance the resizer created and removed in one call is not modelled")) };
-                    let di = &new.insts[k];
-                    if !di.core_auto_placeable {
-                        continue;
-                    }
-                    // `Instance(db_inst)` (`copyDbLocation`: padded) → `GCell(inst)`
-                    let mut inst = crate::placer_base::Instance { db: Some(k), lx: di.bbox.lx, ly: di.bbox.ly, ux: di.bbox.lx + di.bbox.dx(), uy: di.bbox.ly + di.bbox.dy(), fixed: di.fixed, macro_: di.master_is_block, locked: false };
-                    if inst.is_place_instance() {
-                        inst.lx -= pad_left * c.site_x;
-                        inst.ux += pad_right * c.site_x;
-                    }
+                    let (inst, b, group) = match new_ix.get(name) {
+                        Some(&k) => {
+                            let di = &new.insts[k];
+                            if !di.core_auto_placeable {
+                                continue;
+                            }
+                            // `Instance(db_inst)` (`copyDbLocation`: padded) → `GCell(inst)`
+                            let mut inst = crate::placer_base::Instance { db: Some(k), lx: di.bbox.lx, ly: di.bbox.ly, ux: di.bbox.lx + di.bbox.dx(), uy: di.bbox.ly + di.bbox.dy(), fixed: di.fixed, macro_: di.master_is_block, locked: false };
+                            if inst.is_place_instance() {
+                                inst.lx -= pad_left * c.site_x;
+                                inst.ux += pad_right * c.site_x;
+                            }
+                            (inst, di.bbox, di.group.map(|g| new.groups[g].name.as_str()))
+                        }
+                        None => {
+                            let master = f.get(2).copied().unwrap_or_default();
+                            let Some(m) = report.event_masters.get(master) else { return refuse(format!("{name}: the master of an instance the resizer created and removed in one call was not read")) };
+                            if !m.core_auto_placeable {
+                                continue;
+                            }
+                            if !new.groups.is_empty() {
+                                return refuse(format!("{name}: the region of an instance the resizer created and removed in one call is not modelled"));
+                            }
+                            let Some((inst, b)) = create_cbk_gcell_gone(m, pad_left, pad_right, c.site_x, c.site_y) else { return refuse(format!("{name}: a macro the resizer created and removed in one call is not modelled")) };
+                            gone_master.insert(name.to_string(), master.to_string());
+                            (inst, b, None)
+                        }
+                    };
                     out.delta_area += i64::from(inst.ux - inst.lx) * i64::from(inst.uy - inst.ly);
                     c.insts.push(inst.clone());
                     let ck = c.insts.len() - 1;
-                    // `moveGCell` on the resizer's `setLocation`: every box the database's
-                    let b = di.bbox;
+                    // `moveGCell` on the resizer's `setLocation` (the buffer placed right after it is
+                    // made): every box the database's, unpadded
                     let gi = self.gcells.len();
                     self.gcells.push(GCell { inst: Some(ck), macro_: inst.macro_, lx: b.lx, ly: b.ly, ux: b.ux, uy: b.uy, dlx: b.lx, dly: b.ly, dux: b.ux, duy: b.uy, ..GCell::default() });
                     if self.min_rc_cell_size.len() < self.gcells.len() {
                         self.min_rc_cell_size.resize(self.gcells.len(), (0, 0));
                     }
-                    let nb = match di.group {
+                    let nb = match group {
                         None => self.nbs.iter().position(|nb| nb.group.is_none()),
-                        Some(g) => self.nbs.iter().position(|nb| nb.group.as_deref() == Some(new.groups[g].name.as_str())),
+                        Some(g) => self.nbs.iter().position(|nb| nb.group.as_deref() == Some(g)),
                     };
-                    let Some(b) = nb else { return refuse(format!("{}: a new instance outside the placer's regions is not modelled", di.name)) };
+                    let Some(b) = nb else { return refuse(format!("{name}: a new instance outside the placer's regions is not modelled")) };
                     // `NesterovBase::createCbkGCell`: appended, with every per-cell vector
                     self.nbs[b].append_cell(gi);
                     cell_of.insert(name.to_string(), gi);
@@ -3235,24 +3273,38 @@ impl Nesterov {
                 // each instance's padded box from the database (`copyDbLocation`), the cell's boxes
                 // on it (`updateLocations`: one instance, density box = box), the area change on
                 // `delta_area_`. The pins keep their offsets; the regions' coordinates are untouched.
+                ["swap_before", name, _, to, ..] => {
+                    if let Some(m) = gone_master.get_mut(*name) {
+                        *m = to.to_string();
+                    }
+                }
                 ["swap_after", name, ..] => {
                     let Some(&gi) = cell_of.get(*name) else { continue };
                     if !self.gcells[gi].members.is_empty() {
                         return refuse(format!("{name}: a resized placement-cluster member is not modelled"));
                     }
                     let Some(k) = self.gcells[gi].inst else { continue };
-                    let Some(db) = c.insts[k].db else { continue };
-                    let di = &new.insts[db];
                     let prev = i64::from(self.gcells[gi].dx()) * i64::from(self.gcells[gi].dy());
-                    let inst = &mut c.insts[k];
-                    inst.lx = di.bbox.lx;
-                    inst.ly = di.bbox.ly;
-                    inst.ux = di.bbox.lx + di.bbox.dx();
-                    inst.uy = di.bbox.ly + di.bbox.dy();
-                    if inst.is_place_instance() {
-                        inst.lx -= pad_left * c.site_x;
-                        inst.ux += pad_right * c.site_x;
+                    if let Some(master) = gone_master.get(*name) {
+                        // created and removed in this call: the new master's box where the cell is
+                        let Some(m) = report.event_masters.get(master) else { return refuse(format!("{name}: the master of an instance the resizer created and removed in one call was not read")) };
+                        let g = &self.gcells[gi];
+                        let inst = &mut c.insts[k];
+                        (inst.lx, inst.ly, inst.ux, inst.uy) = (g.lx, g.ly, g.lx + m.width + (pad_left + pad_right) * c.site_x, g.ly + m.height);
+                    } else {
+                        let Some(db) = c.insts[k].db else { continue };
+                        let di = &new.insts[db];
+                        let inst = &mut c.insts[k];
+                        inst.lx = di.bbox.lx;
+                        inst.ly = di.bbox.ly;
+                        inst.ux = di.bbox.lx + di.bbox.dx();
+                        inst.uy = di.bbox.ly + di.bbox.dy();
+                        if inst.is_place_instance() {
+                            inst.lx -= pad_left * c.site_x;
+                            inst.ux += pad_right * c.site_x;
+                        }
                     }
+                    let inst = &c.insts[k];
                     let (lx, ly, ux, uy) = (inst.lx, inst.ly, inst.ux, inst.uy);
                     let g = &mut self.gcells[gi];
                     (g.lx, g.ly, g.ux, g.uy) = (lx, ly, ux, uy);
@@ -4321,6 +4373,24 @@ fn vyg_dump_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (4155ac3, `NesterovBaseCommon::createCbkGCell` + `Instance::copyDbLocation`):
+    /// an instance the resizer creates and removes in one call (simple01-td-restart: repair_design's
+    /// `fanout1`, removed by `fullyRebuffer`) still gets its cell at `inDbInstCreate` — at the
+    /// origin, padded left and right by the site width since it is not fixed, its area on
+    /// `delta_area_` — and the resizer's `setLocation` then sets the cell's boxes to the database
+    /// box, unpadded (`moveGCell`); a BLOCK master or one more than six rows tall is a macro.
+    #[test]
+    fn a_cell_created_and_removed_in_one_call_is_made_at_the_callback() {
+        let m = crate::timing_driven::EventMaster { width: 760, height: 1400, core_auto_placeable: true, is_block: false };
+        let (inst, b) = create_cbk_gcell_gone(&m, 2, 1, 190, 1400).expect("a buffer is not a macro");
+        assert_eq!((inst.lx, inst.ly, inst.ux, inst.uy), (-380, 0, 950, 1400), "padded at the origin");
+        assert!(inst.db.is_none() && !inst.fixed && !inst.macro_);
+        assert_eq!((b.lx, b.ly, b.ux, b.uy), (0, 0, 760, 1400), "the cell on the database box, unpadded");
+        assert!(create_cbk_gcell_gone(&crate::timing_driven::EventMaster { is_block: true, ..m }, 0, 0, 190, 1400).is_none());
+        assert!(create_cbk_gcell_gone(&crate::timing_driven::EventMaster { height: 7 * 1400, ..m }, 0, 0, 190, 1400).is_none(), "over six rows: a macro");
+        assert!(create_cbk_gcell_gone(&crate::timing_driven::EventMaster { height: 6 * 1400, ..m }, 0, 0, 190, 1400).is_some(), "six rows: still a cell");
+    }
 
     /// An IO placer over a 100 x 80 die with every pin free on the whole perimeter.
     fn io_state(gpins: Vec<Option<usize>>) -> IoState {

@@ -19,6 +19,21 @@ pub struct ResizeReport {
     pub net_ids_after: Vec<u32>,
     pub slacks: Vec<(String, f32)>,
     pub design: Design,
+    /// Each master an instance callback names (`inst_create|I|master`, `swap_before|I|from|to`),
+    /// as the database has it: what a cell the call created and removed again was made of, since
+    /// the design read after the call no longer holds that instance.
+    pub event_masters: std::collections::HashMap<String, EventMaster>,
+}
+
+/// A master's size and type, read when the instance that used it may be gone.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EventMaster {
+    pub width: i32,
+    pub height: i32,
+    /// `dbMaster::isCoreAutoPlaceable`.
+    pub core_auto_placeable: bool,
+    /// `getType().isBlock()`.
+    pub is_block: bool,
 }
 
 /// `PlaceOptions`' timing-driven fields and `TimingBase`'s state.
