@@ -347,6 +347,19 @@ fn bivariate_normal_cdf(mean_x: f32, mean_y: f32, sigma_x: f32, sigma_y: f32, lx
     (0.25 * f64::from(s)) as f32
 }
 
+/// `FFT::init`'s x wavenumber (CPU backend, extended precision): `PI * i / binCntX`.
+fn wavenumber_x(i: usize, nx: i32) -> f32 {
+    ld::PI.times(Ld::from_f32(i as f32)).over(Ld::from_f32(nx as f32)).to_f32()
+}
+
+/// `FFT::init`'s y wavenumber at 4155ac3: `PI * i / binCntY * binSizeY / binSizeX`, in that
+/// order, in extended precision. ⚠️ After the pin, OpenROAD #12051 (befc1d60d6 CPU, d4cf0a7d83
+/// GPU) scales it by `binSizeX / binSizeY` instead — the inverse — which moves every golden whose
+/// bins are not square; at the next repin this function is the one edit (and its test).
+fn wavenumber_y(i: usize, ny: i32, bin_x: f32, bin_y: f32) -> f32 {
+    ld::PI.times(Ld::from_f32(i as f32)).over(Ld::from_f32(ny as f32)).times(Ld::from_f32(bin_y)).over(Ld::from_f32(bin_x)).to_f32()
+}
+
 /// The FFT context: the bin grid's density, potential and field, and the solver's tables.
 #[derive(Debug, Clone)]
 struct Fft {
@@ -384,11 +397,11 @@ impl Fft {
             wy2: vec![0.0; nyu],
         };
         for i in 0..nxu {
-            f.wx[i] = ld::PI.times(Ld::from_f32(i as f32)).over(Ld::from_f32(nx as f32)).to_f32();
+            f.wx[i] = wavenumber_x(i, nx);
             f.wx2[i] = f.wx[i] * f.wx[i];
         }
         for i in 0..nyu {
-            f.wy[i] = ld::PI.times(Ld::from_f32(i as f32)).over(Ld::from_f32(ny as f32)).times(Ld::from_f32(bin_y)).over(Ld::from_f32(bin_x)).to_f32();
+            f.wy[i] = wavenumber_y(i, ny, bin_x, bin_y);
             f.wy2[i] = f.wy[i] * f.wy[i];
         }
         f
@@ -4373,6 +4386,18 @@ fn vyg_dump_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (4155ac3 `FFT::init`): `wx = PI * i / binCntX`; `wy = PI * i / binCntY *
+    /// binSizeY / binSizeX` (#12051, after the pin, inverts the bin ratio). Square bins: the two
+    /// agree; bins twice as tall as wide double wy.
+    #[test]
+    fn fft_wavenumbers_scale_y_by_bin_height_over_width() {
+        assert_eq!(wavenumber_x(0, 64), 0.0);
+        assert_eq!(wavenumber_x(32, 64), std::f32::consts::FRAC_PI_2);
+        assert_eq!(wavenumber_y(32, 64, 3.0, 3.0), wavenumber_x(32, 64), "square bins");
+        assert_eq!(wavenumber_y(32, 64, 1.0, 2.0), std::f32::consts::PI, "bin_y / bin_x = 2");
+        assert_eq!(wavenumber_y(32, 64, 2.0, 1.0), std::f32::consts::FRAC_PI_4, "bin_y / bin_x = 1/2");
+    }
 
     /// Upstream rule (4155ac3, `NesterovBaseCommon::createCbkGCell` + `Instance::copyDbLocation`):
     /// an instance the resizer creates and removes in one call (simple01-td-restart: repair_design's
