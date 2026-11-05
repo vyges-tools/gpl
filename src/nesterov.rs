@@ -1310,6 +1310,49 @@ impl IoState {
     }
 }
 
+/// `IoPinBase::IoPinBase`'s pins: every port with a net that is not FIXED, in block order — a
+/// port the placer gave no GPin (one on a reset net, say: `dbToNb` is null) among them — with its
+/// GPin; and how many of them are already PLACED (GPL-0184).
+fn movable_io_ports(ports: &[crate::placer_base::IoPort], port_gpin: &HashMap<String, usize>) -> (Vec<(usize, Option<usize>)>, usize) {
+    let mut movable = Vec::new();
+    let mut already = 0;
+    for (pi, p) in ports.iter().enumerate() {
+        if p.fixed || p.net.is_none() {
+            continue;
+        }
+        if p.placed {
+            already += 1;
+        }
+        movable.push((pi, port_gpin.get(&p.name).copied()));
+    }
+    (movable, already)
+}
+
+/// `IoPinBase::seed`, before the projection: a pin already in the database at its box centre;
+/// otherwise the centroid of the instance cells on its net (`net_pins`: its GNet's pins, none for a
+/// pin with no GPin); with no instance there, the die centre.
+fn io_seed(die: crate::placer_base::Rect, bbox: Option<crate::placer_base::Rect>, net_pins: &[usize], gpins: &[GPin], gcells: &[GCell]) -> (f32, f32) {
+    if let Some(b) = bbox {
+        return (((b.lx + b.ux) / 2) as f32, ((b.ly + b.uy) / 2) as f32);
+    }
+    let (mut sx, mut sy, mut cnt) = (0i64, 0i64, 0i64);
+    for &q in net_pins {
+        if let Some(gc) = gpins[q].gcell {
+            let g = &gcells[gc];
+            if g.is_instance() {
+                sx += i64::from((g.lx + g.ux) / 2);
+                sy += i64::from((g.ly + g.uy) / 2);
+                cnt += 1;
+            }
+        }
+    }
+    if cnt == 0 {
+        (((die.lx + die.ux) / 2) as f32, ((die.ly + die.uy) / 2) as f32)
+    } else {
+        (sx as f32 / cnt as f32, sy as f32 / cnt as f32)
+    }
+}
+
 /// `IoPinBase::IoPinBase`: the movable ports (not fixed, on a net; GPL-0184 counts the placed
 /// ones) in block order with their pin sizes (an unplaced one a micron square); the `up:` boxes
 /// and their grid (GPL-0183); the mirror pairs; the slots; the constraints; each non-follower
@@ -1317,18 +1360,7 @@ impl IoState {
 /// truncated — then each follower at its master's reflection; the GPins placed there (GPL-0171).
 fn init_io_pin_base(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<IoState> {
     let die = Die { lx: d.die.lx as f32, ly: d.die.ly as f32, ux: d.die.ux as f32, uy: d.die.uy as f32 };
-    let mut movable = Vec::new();
-    let mut already = 0;
-    for (pi, p) in d.ports.iter().enumerate() {
-        if p.fixed || p.net.is_none() {
-            continue;
-        }
-        let gp = np.port_gpin.get(&p.name).copied();
-        if p.placed {
-            already += 1;
-        }
-        movable.push((pi, gp));
-    }
+    let (movable, already) = movable_io_ports(&d.ports, &np.port_gpin);
     if already > 0 {
         log.warn("GPL", 184, format!("Concurrent IO placement moves {already} already placed IO pins. Set them FIXED to keep their positions."));
     }
@@ -1395,29 +1427,8 @@ fn init_io_pin_base(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<IoState
         if io.is_follower[i] {
             continue;
         }
-        let p = &d.ports[movable[i].0];
-        let (x, y) = match p.bbox {
-            Some(b) => (((b.lx + b.ux) / 2) as f32, ((b.ly + b.uy) / 2) as f32),
-            None => {
-                let pins: &[usize] = movable[i].1.map_or(&[], |gp| np.gnets[np.pin_net[gp]].pins.as_slice());
-                let (mut sx, mut sy, mut cnt) = (0i64, 0i64, 0i64);
-                for &q in pins {
-                    if let Some(gc) = np.gpins[q].gcell {
-                        let g = &np.gcells[gc];
-                        if g.is_instance() {
-                            sx += i64::from((g.lx + g.ux) / 2);
-                            sy += i64::from((g.ly + g.uy) / 2);
-                            cnt += 1;
-                        }
-                    }
-                }
-                if cnt == 0 {
-                    (((d.die.lx + d.die.ux) / 2) as f32, ((d.die.ly + d.die.uy) / 2) as f32)
-                } else {
-                    (sx as f32 / cnt as f32, sy as f32 / cnt as f32)
-                }
-            }
-        };
+        let net_pins: &[usize] = movable[i].1.map_or(&[], |gp| np.gnets[np.pin_net[gp]].pins.as_slice());
+        let (x, y) = io_seed(d.die, d.ports[movable[i].0].bbox, net_pins, &np.gpins, &np.gcells);
         let (px, py) = io.project(i, x, y);
         io.cur[i] = FloatPoint::new((px as i32) as f32, (py as i32) as f32);
     }
@@ -4287,6 +4298,71 @@ fn vyg_dump_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An IO placer over a 100 x 80 die with every pin free on the whole perimeter.
+    fn io_state(gpins: Vec<Option<usize>>) -> IoState {
+        let n = gpins.len();
+        let die = Die { lx: 0.0, ly: 0.0, ux: 100.0, uy: 80.0 };
+        IoState {
+            die,
+            names: (0..n).map(|i| format!("p{i}")).collect(),
+            gpins,
+            pin_size: vec![(1, 1); n],
+            boxes: vec![None; n],
+            segs: vec![Vec::new(); n],
+            free: io_pins::free_segments(&die, &[], [true; 4]),
+            follower: vec![None; n],
+            is_follower: vec![false; n],
+            pairs: Vec::new(),
+            edge_slots: Default::default(),
+            edge_slot_layers: Default::default(),
+            axis_slots: Default::default(),
+            ring: Vec::new(),
+            ring_begin: [0; 4],
+            prev: vec![FloatPoint::default(); n],
+            cur: vec![FloatPoint::default(); n],
+            next: vec![FloatPoint::default(); n],
+            snapshot: vec![FloatPoint::default(); n],
+            last: vec![(i32::MIN, i32::MIN); n],
+            last_layer: vec![None; n],
+            top: None,
+            next_calls: 0,
+        }
+    }
+
+    fn io_port(name: &str, net: Option<usize>, fixed: bool, placed: bool) -> crate::placer_base::IoPort {
+        crate::placer_base::IoPort { name: name.into(), net, bbox: None, fixed, placed, constraint: None, mirror: None }
+    }
+
+    /// Upstream rule (`IoPinBase::IoPinBase`, 19901792578; place_ios_rd's `req_msg[0]`): every port
+    /// with a net that is not FIXED is placed — a port the placer gave no GPin (a reset net) too,
+    /// with no GPin; a FIXED port and a port with no net are not. The PLACED ones are counted.
+    #[test]
+    fn a_port_without_a_gpin_is_still_placed() {
+        let ports = [io_port("a", Some(0), false, true), io_port("fixed", Some(1), true, true), io_port("nonet", None, false, false), io_port("reset", Some(2), false, false)];
+        let gpin: HashMap<String, usize> = [("a".to_string(), 7), ("fixed".to_string(), 8)].into_iter().collect();
+        let (movable, already) = movable_io_ports(&ports, &gpin);
+        assert_eq!(movable, vec![(0, Some(7)), (3, None)]);
+        assert_eq!(already, 1);
+    }
+
+    /// Upstream rule (`IoPinBase::seed`): a pin with no box and no GPin starts at the die centre,
+    /// projected onto its locus; with no net box (`netBoxes` skips a null GPin) its optimum is
+    /// where it is, so wirelength never moves it, and `placeGPins` has nothing to place.
+    #[test]
+    fn a_port_without_a_gpin_starts_at_the_projected_die_centre_and_stays() {
+        let die = crate::placer_base::Rect { lx: 0, ly: 0, ux: 100, uy: 80 };
+        assert_eq!(io_seed(die, None, &[], &[], &[]), (50.0, 40.0));
+        let io = io_state(vec![None]);
+        let (x, y) = io.project(0, 50.0, 40.0);
+        // the nearest perimeter point of the centre of a 100 x 80 die: the bottom edge, first of a tie
+        assert_eq!((x, y), (50.0, 0.0));
+        let at = FloatPoint::new(x, y);
+        assert_eq!(io.optimum(0, at, &[], &[], &[]), at, "no net boxes: the optimum is the current point");
+        let mut gpins = vec![GPin { cx: 3, cy: 4, ..GPin::default() }];
+        io.place_gpins(&mut gpins, IoIterate::Cur);
+        assert_eq!((gpins[0].cx, gpins[0].cy), (3, 4), "no GPin of its own: nothing is placed");
+    }
 
     /// Upstream rule (`NesterovPlaceVars`, `6ce7bdb41ad`): with no `-reference_hpwl`, the reference
     /// HPWL is max(floor 4.46e8, 0.01 x design HPWL). A design whose HPWL is above 4.46e10 takes the
