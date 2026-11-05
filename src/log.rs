@@ -34,6 +34,12 @@ impl Log {
         Log { logger: Logger::new().events(tool).stderr(true), trace: Vec::new() }
     }
 
+    /// The logger itself, for another engine's stage run inside this command (`-place_ios`'s
+    /// pin placer), so its lines land in this run's log in order.
+    pub fn logger_mut(&mut self) -> &mut Logger {
+        &mut self.logger
+    }
+
     /// The lines printed so far.
     pub fn lines(&self) -> &[String] {
         self.logger.lines()

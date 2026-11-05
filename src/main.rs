@@ -21,7 +21,7 @@ fn e(err: vyges_opendb::Error) -> Stop {
 
 /// `updateDbGCells` then `reportHpwlMetric`: each instance written where the placer has it, then
 /// GPL-1018.
-fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i32, i32)], io: &[vyges_gpl::run::IoWrite]) -> Result<(), String> {
+fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i32, i32)], io: &[vyges_gpl::run::IoWrite], place_ios: bool) -> Result<(), String> {
     use vyges_gpl::route_base::Router;
     let stop = |s: Stop| match s {
         Stop::Refused(m) => m,
@@ -31,6 +31,12 @@ fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i3
     router.write_locations(log, locations).map_err(stop)?;
     // `updateDbIoPins`: the pins moved since the last write
     router.write_io_pins(log, io).map_err(stop)?;
+    // `-place_ios`: once Nesterov placement is done, "legalize the solved pins, moving each as
+    // little as possible" — the pin placer's matching in its displacement-minimising mode, on the
+    // database as just written — and only then the final HPWL (`reportHpwlMetric`).
+    if place_ios {
+        vyges_ppl::matching::run_hungarian_matching(router.db, true, log.logger_mut()).map_err(|f| f.line())?;
+    }
     router.report_hpwl(log).map_err(stop)
 }
 
@@ -358,7 +364,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 // `updateDbGCells`: each placed instance at its location, PLACED.
                 let db = db.as_mut().expect("read before global_placement");
-                update_db_and_report_hpwl(db, &mut log, &locations, &io)?;
+                update_db_and_report_hpwl(db, &mut log, &locations, &io, args.iter().any(|a| a == "-place_ios"))?;
                 if let Some(path) = job["write_def"].as_str() {
                     db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
                 }
@@ -368,7 +374,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let extra = json!({"insts": c.insts.len(), "nets": c.nets.len(), "pins": c.pins, "nesterov_iterations": iter,
                     "bases": bases.iter().map(|b| json!({"group": b.group, "place": b.place_insts.len(), "fixed": b.fixed_insts.len(), "dummies": b.dummies.len()})).collect::<Vec<_>>()});
                 let db = db.as_mut().expect("read before global_placement");
-                update_db_and_report_hpwl(db, &mut log, &locations, &io)?;
+                update_db_and_report_hpwl(db, &mut log, &locations, &io, args.iter().any(|a| a == "-place_ios"))?;
                 if let Some(path) = job["write_def"].as_str() {
                     db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
                 }

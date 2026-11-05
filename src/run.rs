@@ -103,15 +103,21 @@ fn placement_threads(log: &mut Log, t: Threads) -> usize {
     t.cores
 }
 
+/// The `global_placement` proc's `-place_ios` checks, in its order: the first of `-skip_io`
+/// (GPL-0169), `-incremental` (GPL-0170) and `-skip_nesterov_place` (GPL-0182) present, with its
+/// message id. Routability- and timing-driven placement are NOT among them: concurrent IO
+/// placement runs inside both.
+fn place_ios_conflict(flags: &[String]) -> Option<(u32, &'static str)> {
+    [(169, "-skip_io"), (170, "-incremental"), (182, "-skip_nesterov_place")].into_iter().find(|(_, f)| flags.iter().any(|x| x == f))
+}
+
 /// The `global_placement` proc.
 pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Threads, router: Option<&mut dyn Router>) -> Res<Outcome> {
     let (keys, flags) = parse_key_args(log, "global_placement", args, KEYS, FLAGS)?;
     let flag = |f: &str| flags.iter().any(|x| x == f);
     if flag("-place_ios") {
-        for (other, id, what) in [("-skip_io", 169, "-skip_io"), ("-incremental", 170, "-incremental"), ("-skip_nesterov_place", 182, "-skip_nesterov_place"), ("-timing_driven", 179, "-timing_driven"), ("-routability_driven", 181, "-routability_driven")] {
-            if flag(other) {
-                return log.error("GPL", id, format!("-place_ios cannot be used with {what} placement."));
-            }
+        if let Some((id, what)) = place_ios_conflict(&flags) {
+            return log.error("GPL", id, format!("-place_ios cannot be used with {what} placement."));
         }
     }
     // replace_initial_place_cmd: the options, then doInitialPlace.
@@ -395,6 +401,19 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    // Rule (replace.tcl's global_placement, 4155ac3): -place_ios refuses -skip_io (GPL-0169),
+    // -incremental (GPL-0170) and -skip_nesterov_place (GPL-0182), checked in that order; it runs
+    // with -routability_driven and -timing_driven (place_ios_rd / place_ios_td), whose old
+    // refusals GPL-0181 / GPL-0179 the reference no longer has.
+    #[test]
+    fn place_ios_refuses_only_what_the_reference_refuses() {
+        assert_eq!(place_ios_conflict(&s(&["-place_ios", "-skip_io"])), Some((169, "-skip_io")));
+        assert_eq!(place_ios_conflict(&s(&["-incremental", "-place_ios"])), Some((170, "-incremental")));
+        assert_eq!(place_ios_conflict(&s(&["-skip_nesterov_place"])), Some((182, "-skip_nesterov_place")));
+        assert_eq!(place_ios_conflict(&s(&["-skip_nesterov_place", "-skip_io"])), Some((169, "-skip_io")), "the first in the proc's order");
+        assert_eq!(place_ios_conflict(&s(&["-place_ios", "-routability_driven", "-timing_driven"])), None);
     }
 
     // Rule (sta::parse_key_args): exact matches first; else the FIRST key, then flag, the argument
