@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use vyges_gpl::log::{refuse, Log, Res, Stop};
-use vyges_gpl::placer_base::{Blockage, DbInst, DbNet, Design, Group, IoPort, Port, Rect, Region, Term};
+use vyges_gpl::placer_base::{Blockage, DbInst, DbNet, Design, Group, IoPort, IoSlot, Port, Rect, Region, Term};
 use vyges_gpl::run::Outcome;
 use vyges_opendb::Db;
 
@@ -160,7 +160,7 @@ fn design(db: &Db) -> Res<Design> {
 }
 
 /// What `-place_ios` reads: every block terminal in block order, the pin blockages, the
-/// top-layer pin grid and the first horizontal / vertical routing layers.
+/// top-layer pin grid, the die polygon, and the pin placer's settings and slot grid.
 fn read_io(db: &Db, d: &mut Design) -> Res<()> {
     let net_ix: HashMap<String, usize> = d.nets.iter().enumerate().map(|(i, n)| (n.name.clone(), i)).collect();
     for b in db.bterm_names() {
@@ -178,18 +178,38 @@ fn read_io(db: &Db, d: &mut Design) -> Res<()> {
         let w = db.layer_get_width(&g.layer) as i32;
         (g.layer, g.pin_width, g.pin_height, w)
     });
-    for (layer, dir) in db.layers_with_direction().map_err(e)? {
-        if db.layer_get_routing_level(&layer) == 0 {
-            continue;
-        }
-        let w = db.layer_get_width(&layer) as i32;
-        if dir == "HORIZONTAL" && d.io.hor.is_none() {
-            d.io.hor = Some((layer, w));
-        } else if dir == "VERTICAL" && d.io.ver.is_none() {
-            d.io.ver = Some((layer, w));
+    d.io.die_points = db.die_area_polygon().map_err(e)?.len();
+    // `buildSlotGrid`: the pin placer's slots on what `set_place_config` stored. Without both pin
+    // layer lists there is no grid; `-place_ios` refuses that first (GPL-0174).
+    let pc = vyges_ppl::session::place_config_args(db);
+    let widths = |ls: &[String]| ls.iter().map(|l| (l.clone(), db.layer_get_width(l) as i32)).collect::<Vec<_>>();
+    d.io.pin_layers = (widths(&pc.hor), widths(&pc.ver));
+    if !pc.hor.is_empty() && !pc.ver.is_empty() {
+        match vyges_ppl::session::slot_grid(db, &pc) {
+            Err(m) => d.io.slots_error = Some(format!("-place_ios: the pin placer's slot grid: {m}")),
+            Ok(g) => {
+            let mut h: u64 = vyges_gpl::nesterov::FNV0;
+            for s in &g.slots {
+                // the pin placer's edge numbering: top, bottom, left, right
+                let ppl_edge = match s.edge { vyges_ppl::Edge::Top => 0, vyges_ppl::Edge::Bottom => 1, vyges_ppl::Edge::Left => 2, vyges_ppl::Edge::Right => 3, vyges_ppl::Edge::Invalid => 4 };
+                for v in [s.x, s.y, db.layer_get_routing_level(&s.layer), ppl_edge, i32::from(s.blocked)] {
+                    for b in v.to_le_bytes() {
+                        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+                    }
+                }
+                let edge = match s.edge {
+                    vyges_ppl::Edge::Top => Some(vyges_gpl::io_pins::Edge::Top),
+                    vyges_ppl::Edge::Bottom => Some(vyges_gpl::io_pins::Edge::Bottom),
+                    vyges_ppl::Edge::Left => Some(vyges_gpl::io_pins::Edge::Left),
+                    vyges_ppl::Edge::Right => Some(vyges_gpl::io_pins::Edge::Right),
+                    vyges_ppl::Edge::Invalid => None,
+                };
+                d.io.slots.push(IoSlot { x: s.x, y: s.y, layer: s.layer.clone(), level: db.layer_get_routing_level(&s.layer), edge, blocked: s.blocked });
+            }
+            d.io.slots_probe = Some((g.slots.len(), h));
+            }
         }
     }
-    d.io.die_points = db.die_area_polygon().map_err(e)?.len();
     Ok(())
 }
 

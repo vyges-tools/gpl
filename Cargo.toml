@@ -13,7 +13,7 @@ repository = "https://github.com/vyges-tools/gpl"
 # that link every engine and run the one they are invoked as.
 suite = ["cli"]
 # The command-line engine: the database and JSON jobs.
-cli = ["dep:vyges-opendb", "vyges-opendb/gen-write", "dep:serde_json", "dep:vyges-grt", "dep:vyges-stt", "dep:vyges-rsz"]
+cli = ["dep:vyges-opendb", "vyges-opendb/gen-write", "dep:serde_json", "dep:vyges-grt", "dep:vyges-stt", "dep:vyges-rsz", "dep:vyges-ppl"]
 
 [dependencies]
 # The suite's logger: the run's lines in the reference's format, each also an event (the CLI's
@@ -28,6 +28,9 @@ vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", o
 # Timing-driven placement repairs and re-times the design at each reweight with the resizer
 # (repair_design, the placement-time rebuffering, the driver slacks), on the placer's database.
 vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", optional = true, features = ["cli"] }
+# Concurrent IO placement (`-place_ios`) solves on the pin placer's slot grid
+# (`buildSlotGrid`) and legalizes with its assignment (`runHungarianMatching`).
+vyges-ppl = { git = "https://github.com/vyges-tools/ppl.git", branch = "main", optional = true }
 serde_json = { version = "1", optional = true }
 
 [lib]
@@ -66,6 +69,9 @@ vyges-sta = { path = "../vyges-tools-sta" }
 
 [patch."https://github.com/vyges-tools/rsz.git"]
 vyges-rsz = { path = "../vyges-tools-rsz" }
+
+[patch."https://github.com/vyges-tools/ppl.git"]
+vyges-ppl = { path = "../vyges-tools-ppl" }
 
 [patch."https://github.com/vyges-tools/dpl.git"]
 vyges-dpl = { path = "../vyges-tools-dpl" }

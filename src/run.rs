@@ -180,14 +180,14 @@ pub fn global_placement(log: &mut Log, d: &Design, args: &[String], threads: Thr
                     let iter = nesterov::do_nesterov_place(log, d, &mut nb, None, Some(&mut t))?;
                     let design = t.design;
                     let locations = nesterov::placed_locations(&c, &nb);
-                    let io = nesterov::io_pin_writes(&mut nb);
+                    let io = nesterov::io_pin_writes(&mut nb, log);
                     return Ok(Outcome::PlacedEdited(c, bases, locations, iter, io, Box::new(design)));
                 }
                 (_, _, None) => return refuse("-routability_driven / -timing_driven need the design database"),
                 (None, None, _) => nesterov::do_nesterov_place(log, d, &mut nb, None, None)?,
             };
             let locations = nesterov::placed_locations(&c, &nb);
-            let io = nesterov::io_pin_writes(&mut nb);
+            let io = nesterov::io_pin_writes(&mut nb, log);
             Ok(Outcome::Placed(c, bases, locations, iter, io))
         }
         (other, _) => Ok(other),
@@ -267,10 +267,17 @@ fn nesterov_opts(keys: &BTreeMap<String, String>, flags: &[String], v: &Vars) ->
 
 pub use crate::nesterov::IoWrite;
 
-/// `checkPlaceIosSupported`: `-place_ios` needs a rectangular die (GPL-0173).
+/// `checkPlaceIosSupported`: `-place_ios` needs a rectangular die (GPL-0173) and both of the pin
+/// placer's pin layer lists set (GPL-0174).
 fn check_place_ios_supported(log: &mut Log, d: &Design, v: &Vars) -> Res<()> {
-    if v.place_ios && d.io.die_points > 5 {
+    if !v.place_ios {
+        return Ok(());
+    }
+    if d.io.die_points > 5 {
         return log.error("GPL", 173, "Concurrent IO placement does not support non-rectangular die. Please drop -place_ios or use a rectangular die.");
+    }
+    if d.io.pin_layers.0.is_empty() || d.io.pin_layers.1.is_empty() {
+        return log.error("GPL", 174, "-place_ios: pin layers are not set. Set both -io_pin_hor_layers and -io_pin_ver_layers with set_place_config.");
     }
     Ok(())
 }

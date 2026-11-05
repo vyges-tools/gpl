@@ -17,7 +17,8 @@ impl Edge {
     pub fn horizontal(self) -> bool {
         matches!(self, Edge::Bottom | Edge::Top)
     }
-    fn index(self) -> usize {
+    /// `DieEdge`'s value: left, right, bottom, top.
+    pub fn index(self) -> usize {
         match self {
             Edge::Left => 0,
             Edge::Right => 1,
@@ -92,10 +93,10 @@ pub fn intersect_segs(a: &[Seg], b: &[Seg]) -> Vec<Seg> {
     out
 }
 
-/// `initIoConstraints`' free perimeter: each edge (left, right, bottom, top) less its blocked
-/// intervals, sorted by `(lo, hi)`; a blocked interval that does not reach past the cursor is
-/// skipped.
-pub fn free_segments(die: &Die, blocked: &[(i32, i32, i32, i32)]) -> Vec<Seg> {
+/// `initConstraints`' free perimeter: each edge (left, right, bottom, top) that has a slot
+/// (`addFreeEdge` skips one without) less its blocked intervals, sorted by `(lo, hi)`; a blocked
+/// interval that does not reach past the cursor is skipped.
+pub fn free_segments(die: &Die, blocked: &[(i32, i32, i32, i32)], has_slots: [bool; 4]) -> Vec<Seg> {
     let mut by_edge: [Vec<(f32, f32)>; 4] = Default::default();
     for &r in blocked {
         if let Some(s) = rect_to_seg(die, r) {
@@ -104,6 +105,9 @@ pub fn free_segments(die: &Die, blocked: &[(i32, i32, i32, i32)]) -> Vec<Seg> {
     }
     let mut out = Vec::new();
     for (edge, lo, hi) in [(Edge::Left, die.ly, die.uy), (Edge::Right, die.ly, die.uy), (Edge::Bottom, die.lx, die.ux), (Edge::Top, die.lx, die.ux)] {
+        if !has_slots[edge.index()] {
+            continue;
+        }
         let blk = &mut by_edge[edge.index()];
         blk.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
         let mut cursor = lo;
@@ -320,11 +324,21 @@ mod tests {
     /// a fully blocked edge leaves nothing.
     #[test]
     fn free_perimeter_cuts_the_blocked_intervals() {
-        let free = free_segments(&DIE, &[(0, 80, 100, 80), (0, 20, 0, 30), (0, 0, 0, 10)]);
+        let free = free_segments(&DIE, &[(0, 80, 100, 80), (0, 20, 0, 30), (0, 0, 0, 10)], [true; 4]);
         assert_eq!(free[0], Seg { edge: Edge::Left, lo: 10.0, hi: 20.0 });
         assert_eq!(free[1], Seg { edge: Edge::Left, lo: 30.0, hi: 80.0 });
         assert_eq!(free.iter().filter(|s| s.edge == Edge::Top).count(), 0);
         assert_eq!(free.len(), 4);
+    }
+
+    /// Rule (`initConstraints`' `addFreeEdge`, upstream 19901792578): an edge with no free slot
+    /// adds no segment, blocked or not — a pin is never drawn to an edge the pin placer cannot
+    /// legalize it on.
+    #[test]
+    fn free_perimeter_skips_an_edge_without_slots() {
+        let free = free_segments(&DIE, &[], [true, false, true, true]);
+        assert_eq!(free.iter().map(|s| s.edge).collect::<Vec<_>>(), vec![Edge::Left, Edge::Bottom, Edge::Top]);
+        assert!(free_segments(&DIE, &[], [false; 4]).is_empty());
     }
 
     /// Rule (`nearestSegment`): strictly nearer wins, so of two equally near the first is kept.

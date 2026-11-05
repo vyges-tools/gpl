@@ -129,12 +129,33 @@ pub struct IoSetup {
     pub blocked: Vec<(i32, i32, i32, i32)>,
     /// `getBTermTopLayerGrid()`: its layer, pin width and height, and the layer's width.
     pub top_grid: Option<(String, i32, i32, i32)>,
-    /// The first horizontal and first vertical routing layer (`pickIoPinDummyLayers`), each
-    /// with its width.
-    pub hor: Option<(String, i32)>,
-    pub ver: Option<(String, i32)>,
     /// The die polygon's point count (`getDieAreaPolygon`): more than 5 is not a rectangle.
     pub die_points: usize,
+    /// `set_place_config`'s pin layers (`PinPlacementSettings`): horizontal, vertical.
+    pub pin_layers: (Vec<PinLayer>, Vec<PinLayer>),
+    /// `IOPlacer::buildSlotGrid` on those settings, in the pin placer's order.
+    pub slots: Vec<IoSlot>,
+    /// `VYGIOS`: the slot list's count and FNV-1a of (x, y, routing level, ppl edge, blocked);
+    /// `None` when no grid was built.
+    pub slots_probe: Option<(usize, u64)>,
+    /// Why the pin placer could not build the grid, when it could not.
+    pub slots_error: Option<String>,
+}
+
+/// A pin layer: its name and width, in routing-level order.
+pub type PinLayer = (String, i32);
+
+/// One pin slot (`ppl::SlotPosition`): its position, layer, die edge (`None` off the edges — a
+/// top-layer or polygon slot) and whether something already occupies it.
+#[derive(Debug, Clone)]
+pub struct IoSlot {
+    pub x: i32,
+    pub y: i32,
+    pub layer: String,
+    /// The layer's routing level: of two slots at one coordinate the lower level sorts first.
+    pub level: i32,
+    pub edge: Option<crate::io_pins::Edge>,
+    pub blocked: bool,
 }
 
 /// One instance terminal on a net: its instance (index into [`Design::insts`]) and the union of
