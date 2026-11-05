@@ -27,17 +27,11 @@ fn update_db_and_report_hpwl(db: &mut Db, log: &mut Log, locations: &[(usize, i3
         Stop::Refused(m) => m,
         Stop::Error { tool, id } => format!("{tool}-{id:04}"),
     };
-    vyges_gpl::db_router::DbRouter::new(db).write_locations(log, locations).map_err(stop)?;
-    // `updateDbIoPins`: every pin of the port destroyed, one PLACED pin at the solved centre
-    for (port, layer, rect) in io {
-        db.bterm_clear_unfixed_bpins(port).map_err(|e| format!("{port}: {e}"))?;
-        if db.num_bterm_get_b_pins(port) != 0 {
-            return Err(format!("{port}: a FIXED pin on a port concurrent IO placement moves is not modelled"));
-        }
-        let k = db.create_bterm_pin(port, layer, *rect).map_err(|e| format!("{port}: {e}"))?;
-        db.bpin_set_placement_status(port, k, "PLACED").map_err(|e| format!("{port}: {e}"))?;
-    }
-    vyges_gpl::db_router::DbRouter::new(db).report_hpwl(log).map_err(stop)
+    let mut router = vyges_gpl::db_router::DbRouter::new(db);
+    router.write_locations(log, locations).map_err(stop)?;
+    // `updateDbIoPins`: the pins moved since the last write
+    router.write_io_pins(log, io).map_err(stop)?;
+    router.report_hpwl(log).map_err(stop)
 }
 
 /// The design as `PlacerBaseCommon` / `PlacerBase` read it, in the block's own orders.

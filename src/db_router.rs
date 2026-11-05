@@ -81,6 +81,19 @@ impl Router for DbRouter<'_> {
         Ok(())
     }
 
+    fn write_io_pins(&mut self, _log: &mut Log, io: &[crate::nesterov::IoWrite]) -> Res<()> {
+        for (port, layer, rect) in io {
+            let at = |err: vyges_opendb::Error| e(format!("{port}: {err}"));
+            self.db.bterm_clear_unfixed_bpins(port).map_err(at)?;
+            if self.db.num_bterm_get_b_pins(port) != 0 {
+                return refuse(format!("{port}: a FIXED pin on a port concurrent IO placement moves is not modelled"));
+            }
+            let k = self.db.create_bterm_pin(port, layer, *rect).map_err(at)?;
+            self.db.bpin_set_placement_status(port, k, "PLACED").map_err(at)?;
+        }
+        Ok(())
+    }
+
     /// `reportHpwlMetric`: the signal nets' terminal boxes (no supply or special net), summed.
     fn report_hpwl(&mut self, log: &mut Log) -> Res<()> {
         let mut hpwl = 0i64;

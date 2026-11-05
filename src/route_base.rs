@@ -90,6 +90,9 @@ pub type Box4 = (i32, i32, i32, i32);
 pub trait Router {
     /// `updateDbGCells`: each instance at its location.
     fn write_locations(&mut self, log: &mut Log, locations: &[(usize, i32, i32)]) -> Res<()>;
+    /// `IoPinBase::updateDb`'s database half: each pin's every BPin destroyed, one PLACED BPin
+    /// with the box on its layer created.
+    fn write_io_pins(&mut self, log: &mut Log, io: &[crate::nesterov::IoWrite]) -> Res<()>;
     /// `reportHpwlMetric`: GPL-1018, the design's HPWL as the database has it.
     fn report_hpwl(&mut self, log: &mut Log) -> Res<()>;
     /// `GlobalRouter::getRudy`'s grid — the router initialized (`initFastRoute`) when it is not.

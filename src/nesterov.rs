@@ -1585,42 +1585,57 @@ fn init_io_constraints(log: &mut Log, d: &Design, movable: &[(usize, Option<usiz
 /// An IO pin to rebuild: `(port, layer, box)`.
 pub type IoWrite = (String, String, (i32, i32, i32, i32));
 
-/// `IoPinBase::updateDb`: each pin at its current position rounded — on the `up:` grid's layer
-/// for a box-constrained pin, else on the layer of its slot (a pin sharing a slot coordinate on
-/// the same edge with an earlier one takes the next layer there) — at its half size, never under
-/// half the layer's width; only the pins whose position or layer changed since the last write.
+/// `NesterovPlace::updateDb`'s IO half: each region's `updateDbIoPins`.
 pub fn io_pin_writes(np: &mut Nesterov, log: &mut Log) -> Vec<IoWrite> {
     let mut out = Vec::new();
     for nb in np.nbs.iter_mut() {
-        let Some(io) = nb.io.as_mut() else { continue };
+        out.extend(nb_io_pin_writes(nb, log));
+    }
+    out
+}
+
+/// `NesterovBase::updateDbIoPins`: [`IoState::update_db`] for one region (only the top-level one
+/// has IO pins).
+fn nb_io_pin_writes(nb: &mut Nb, log: &mut Log) -> Vec<IoWrite> {
+    nb.io.as_mut().map_or_else(Vec::new, |io| io.update_db(log))
+}
+
+impl IoState {
+    /// `IoPinBase::updateDb`: each pin at its current position rounded — on the `up:` grid's
+    /// layer for a box-constrained pin, else on the layer of its slot (a pin sharing a slot
+    /// coordinate on the same edge with an earlier one takes the next layer there) — at its half
+    /// size, never under half the layer's width; only the pins whose position or layer changed
+    /// since the last write.
+    fn update_db(&mut self, log: &mut Log) -> Vec<IoWrite> {
+        let mut out = Vec::new();
         let mut pins_at: HashMap<(usize, i32), usize> = HashMap::new();
-        for i in 0..io.names.len() {
-            let at = io.cur[i];
+        for i in 0..self.names.len() {
+            let at = self.cur[i];
             let (cx, cy) = (at.x.round() as i32, at.y.round() as i32);
-            let (layer, width) = if io.boxes[i].is_some() {
-                let (l, _, _, w) = io.top.clone().expect("a box-constrained pin has the grid");
+            let (layer, width) = if self.boxes[i].is_some() {
+                let (l, _, _, w) = self.top.clone().expect("a box-constrained pin has the grid");
                 (l, w)
             } else {
-                let e = io.edge_on_locus(i, cx as f32, cy as f32);
+                let e = self.edge_on_locus(i, cx as f32, cy as f32);
                 let key = (edge_ix(e), if e.horizontal() { cx } else { cy });
                 let nth = *pins_at.get(&key).unwrap_or(&0);
                 pins_at.insert(key, nth + 1);
-                io.pin_layer(e, if e.horizontal() { at.x } else { at.y }, nth)
+                self.pin_layer(e, if e.horizontal() { at.x } else { at.y }, nth)
             };
-            log.trace(format!("VYGIODB|{}|{cx}|{cy}|{layer}", io.names[i]));
-            if io.last[i] == (cx, cy) && io.last_layer[i].as_deref() == Some(layer.as_str()) {
+            log.trace(format!("VYGIODB|{}|{cx}|{cy}|{layer}", self.names[i]));
+            if self.last[i] == (cx, cy) && self.last_layer[i].as_deref() == Some(layer.as_str()) {
                 continue;
             }
-            let (mut hw, mut hh) = io.half_size(i);
+            let (mut hw, mut hh) = self.half_size(i);
             let min_half = width / 2;
             hw = hw.max(min_half);
             hh = hh.max(min_half);
-            out.push((io.names[i].clone(), layer.clone(), (cx - hw, cy - hh, cx + hw, cy + hh)));
-            io.last[i] = (cx, cy);
-            io.last_layer[i] = Some(layer);
+            out.push((self.names[i].clone(), layer.clone(), (cx - hw, cy - hh, cx + hw, cy + hh)));
+            self.last[i] = (cx, cy);
+            self.last_layer[i] = Some(layer);
         }
+        out
     }
-    out
 }
 
 /// `GCell::updateLocations` for a cluster: centred on its instances' bounding box (integer
@@ -3020,6 +3035,8 @@ impl Nesterov {
             }
         }
         if let Some(r) = route.as_mut() {
+            let io = nb_io_pin_writes(&mut self.nbs[b], log);
+            r.router.write_io_pins(log, &io)?;
             let (locations, centres) = (placed_locations(r.common, self), self.std_centres());
             r.rb.calculate_rudy_tiles(log, &mut *r.router, &locations, &centres)?;
             r.rb.update_rudy_average(log, false);
@@ -3456,6 +3473,9 @@ impl Nesterov {
         if virtual_td {
             return refuse("a virtual timing-driven iteration (the resizer's changes rolled back) is not modelled");
         }
+        // `updateDb`: the instances go with each resizer call below; the IO pins here
+        let io = io_pin_writes(self, log);
+        td.router.write_io_pins(log, &io)?;
         // `ClockBase::executeVirtualCts` on the database's locations (`updateDb` first)
         if let Some(fraction) = td.state.virtual_cts {
             let locations = placed_locations(td.common, self);
@@ -4227,6 +4247,9 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
             if np.routability_need && np.average_overflow_unscaled <= np.o.routability_end_overflow && np.is_placement_settled() {
                 np.nbs[0].reprint_header = true;
                 route_reverts += 1;
+                // `updateDbIoPins`: GRT and RUDY read the IO pins from the database
+                let io = nb_io_pin_writes(&mut np.nbs[0], log);
+                r.router.write_io_pins(log, &io)?;
                 let (need, revert_init) = np.routability(log, d, r, route_reverts)?;
                 np.routability_need = need;
                 np.min_hpwl = i64::MAX;
@@ -4328,6 +4351,26 @@ mod tests {
             top: None,
             next_calls: 0,
         }
+    }
+
+    /// Upstream rule (`IoPinBase::updateDb`): a pin is written at its position rounded, on the
+    /// layer of its slot — a pin on the same slot coordinate of the same edge as an earlier one on
+    /// the next layer there — never under half that layer's width; a pin whose position and layer
+    /// are those of the last write is not written again.
+    #[test]
+    fn io_pins_are_written_on_their_slot_layer_only_when_moved() {
+        let mut io = io_state(vec![Some(0), Some(1)]);
+        let bottom = io_pins::Edge::Bottom.index();
+        io.edge_slots[bottom] = vec![10.0, 10.0, 20.0];
+        io.edge_slot_layers[bottom] = vec![("metal2".into(), 140), ("metal4".into(), 280), ("metal2".into(), 140)];
+        io.cur = vec![FloatPoint::new(10.2, 0.0), FloatPoint::new(9.8, 0.0)];
+        let mut log = Log::default();
+        let first = io.update_db(&mut log);
+        assert_eq!(first, vec![("p0".into(), "metal2".into(), (-60, -70, 80, 70)), ("p1".into(), "metal4".into(), (-130, -140, 150, 140))]);
+        assert_eq!(io.update_db(&mut log), Vec::<IoWrite>::new(), "nothing moved: nothing written");
+        io.cur[1] = FloatPoint::new(19.6, 0.0);
+        assert_eq!(io.update_db(&mut log), vec![("p1".to_string(), "metal2".to_string(), (-50, -70, 90, 70))]);
+        assert_eq!(log.trace.len(), 6, "every pin probed at every write");
     }
 
     fn io_port(name: &str, net: Option<usize>, fixed: bool, placed: bool) -> crate::placer_base::IoPort {
