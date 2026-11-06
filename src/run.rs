@@ -341,7 +341,7 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
         }
     }
     // `total_placeable_insts_`: with none in any region the command warns and returns before the
-    // counts (upstream PR 11560 at the pin; before it, GPL-0154/0155/0156 printed 0 and 0).
+    // counts (upstream 5efd57bc12, at the pin; before it, GPL-0154/0155/0156 printed 0 and 0).
     let place_counts: Vec<usize> = bases.iter().map(|b| b.place_insts.len()).collect();
     if no_placeable_instances(&place_counts) {
         log.warn("GPL", 139, "No placeable instances - skipping placement.");
@@ -416,7 +416,7 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
-    // Rule (`Replace::doIncrementalPlace`, PR 11560 at the pin): the placeable instances are
+    // Rule (`Replace::doIncrementalPlace`, 5efd57bc12 at the pin): the placeable instances are
     // counted over EVERY region; only when all are empty does -incremental stop with GPL-0139
     // (witness: correlation variant incremental-all-fixed, the reference at 4155ac31).
     #[test]

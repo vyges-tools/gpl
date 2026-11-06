@@ -3220,7 +3220,7 @@ pub struct TimingDriven<'a> {
     pub pad_right: i32,
 }
 
-/// `fixPointers`, the pin's rule (upstream PR 11560, unchanged 4155ac31..a6e7f507): a cell's
+/// `fixPointers`, the pin's rule (upstream 62f47d8e56, unchanged 4155ac31..a6e7f507): a cell's
 /// terminal that has a placer pin (`db_iterm_to_index_map_`) but now sits on a net with no placer
 /// net (the resizer moved it to one gpl does not place: a supply or special net) is GPL-0335; a
 /// terminal on no net is skipped. Before the pin the pin was silently kept on its old net.
@@ -4668,7 +4668,7 @@ mod tests {
         assert!(!take(100, false, &s(true, 0, 100), 0.1, 0.2, 100), "HPWL not strictly lower");
     }
 
-    /// Upstream rule (`fixPointers`, PR 11560 at the pin): a terminal with a placer pin on a net
+    /// Upstream rule (`fixPointers`, 62f47d8e56 at the pin): a terminal with a placer pin on a net
     /// gpl places keeps its pin; with a pin on a net gpl does not place it is GPL-0335; a terminal
     /// that never had a pin (a supply pin) is not asked.
     #[test]
