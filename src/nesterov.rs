@@ -3170,7 +3170,28 @@ impl Nesterov {
     /// `isPlacementSettled`: every region's last step at most 0.6 of its largest — and some step
     /// taken.
     fn is_placement_settled(&self) -> bool {
-        self.nbs.iter().all(|nb| nb.peak_coordi_distance > 0.0 && nb.coordi_distance <= 0.6f32 * nb.peak_coordi_distance)
+        self.nbs.iter().all(|nb| nb.peak_coordi_distance > 0.0 && nb.coordi_distance <= SETTLE_FRACTION * nb.peak_coordi_distance)
+    }
+
+    /// `getWorstSettleRatio`: the largest over the regions of the last step over the largest step
+    /// (1 for a region that has taken no step).
+    fn worst_settle_ratio(&self) -> f32 {
+        self.nbs.iter().map(|nb| if nb.peak_coordi_distance <= 0.0 { 1.0f32 } else { nb.coordi_distance / nb.peak_coordi_distance }).fold(0.0f32, f32::max)
+    }
+
+    /// `runRoutability`'s settle wait, the pin's rule (upstream d5336340f4 + 81764ed411's wording,
+    /// unchanged 4155ac31..a6e7f507): routability's end is reached (`active`) but the cells still
+    /// move — the first such iteration starts the wait (GPL-0099); the first settled one after a
+    /// wait ends it (GPL-0103, the extra iterations counted from the wait's start). Only logs and
+    /// the wait's start change: the trigger itself is `settled`.
+    fn routability_settle_wait(&mut self, log: &mut Log, iter: i32, active: bool, settled: bool) {
+        let (start, event) = settle_wait_step(self.routability_settle_wait_start_iter, iter, active, settled);
+        self.routability_settle_wait_start_iter = start;
+        match event {
+            SettleWait::Started => log.info("GPL", 99, format!("Routability end extended at iter = {}: overflow {:.4} reached {:.4}, but cells are still moving at {:.0}% of peak displacement (waiting for {:.0}%).", iter + 1, self.average_overflow_unscaled, self.o.routability_end_overflow, f64::from(self.worst_settle_ratio() * 100.0f32), f64::from(SETTLE_FRACTION * 100.0f32))),
+            SettleWait::Finished(extra) => log.info("GPL", 103, format!("Routability end extension finished at iter = {} after {extra} extra iterations: overflow {:.4}, cells moving at {:.0}% of peak displacement.", iter + 1, self.average_overflow_unscaled, f64::from(self.worst_settle_ratio() * 100.0f32))),
+            SettleWait::Nothing => {}
+        }
     }
 
     /// The density centre of every standard (non-macro) instance cell, region by region —
@@ -4302,6 +4323,32 @@ enum DivergeAction {
     Stop,
 }
 
+/// `NesterovBase::kSettleFraction`.
+const SETTLE_FRACTION: f32 = 0.6;
+
+/// What one iteration does to routability's settle wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleWait {
+    Nothing,
+    /// GPL-0099: the wait starts.
+    Started,
+    /// GPL-0103: the wait ends after this many extra iterations.
+    Finished(i32),
+}
+
+/// The settle wait's step (`runRoutability`): the end reached but not settled, and no wait yet,
+/// starts one at `iter`; settled with a wait running ends it; the new start (-1: none) and the
+/// event.
+fn settle_wait_step(start: i32, iter: i32, active: bool, settled: bool) -> (i32, SettleWait) {
+    if active && !settled && start == -1 {
+        (iter, SettleWait::Started)
+    } else if settled && start != -1 {
+        (-1, SettleWait::Finished(iter - start))
+    } else {
+        (start, SettleWait::Nothing)
+    }
+}
+
 /// `kMaxDivergeReverts`, `kMaxRoutabilityDivergeAttempts`.
 const MAX_DIVERGE_REVERTS: i32 = 3;
 const MAX_ROUTABILITY_DIVERGE_ATTEMPTS: i32 = 2;
@@ -4465,7 +4512,10 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         }
         // `runRoutability`
         if let Some(r) = route.as_mut() {
-            if np.routability_need && np.average_overflow_unscaled <= np.o.routability_end_overflow && np.is_placement_settled() {
+            let active = np.routability_need && np.average_overflow_unscaled <= np.o.routability_end_overflow;
+            let settled = active && np.is_placement_settled();
+            np.routability_settle_wait(log, iter, active, settled);
+            if settled {
                 np.nbs[0].reprint_header = true;
                 route_reverts += 1;
                 // `updateDbIoPins`: GRT and RUDY read the IO pins from the database
@@ -4594,6 +4644,19 @@ mod tests {
         assert!(!take(100, false, &s(false, 0, 90), 0.1, 0.2, 100), "no snapshot");
         assert!(!take(100, false, &s(true, 0, 90), 0.3, 0.2, 100), "snapshot overflow worse");
         assert!(!take(100, false, &s(true, 0, 100), 0.1, 0.2, 100), "HPWL not strictly lower");
+    }
+
+    /// Upstream rule (`runRoutability`, d5336340f4/81764ed411): the first iteration at routability's
+    /// end with the cells still moving starts the wait (GPL-0099), later unsettled ones do not
+    /// restart it; the first settled one ends it with the extra iterations since its start
+    /// (GPL-0103); settled with no wait logs nothing; below the end nothing happens.
+    #[test]
+    fn the_routability_settle_wait_starts_once_and_counts_its_extra_iterations() {
+        assert_eq!(settle_wait_step(-1, 40, true, false), (40, SettleWait::Started));
+        assert_eq!(settle_wait_step(40, 41, true, false), (40, SettleWait::Nothing), "still waiting");
+        assert_eq!(settle_wait_step(40, 47, true, true), (-1, SettleWait::Finished(7)));
+        assert_eq!(settle_wait_step(-1, 50, true, true), (-1, SettleWait::Nothing), "settled at once");
+        assert_eq!(settle_wait_step(-1, 30, false, false), (-1, SettleWait::Nothing), "end not reached");
     }
 
     /// Upstream rule (4155ac3 `FFT::init`): `wx = PI * i / binCntX`; `wy = PI * i / binCntY *
