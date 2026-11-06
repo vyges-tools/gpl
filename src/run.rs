@@ -340,6 +340,13 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
             bases.push(placer_base::placer_base(log, d, &common, Some(g), true)?);
         }
     }
+    // `total_placeable_insts_`: with none in any region the command warns and returns before the
+    // counts (upstream PR 11560 at the pin; before it, GPL-0154/0155/0156 printed 0 and 0).
+    let place_counts: Vec<usize> = bases.iter().map(|b| b.place_insts.len()).collect();
+    if no_placeable_instances(&place_counts) {
+        log.warn("GPL", 139, "No placeable instances - skipping placement.");
+        return Ok(Outcome::Unchanged(common, bases));
+    }
     log.info("GPL", 154, format!("Identified {placed} placed instances"));
     log.info("GPL", 155, format!("Identified {unplaced} not placed instances"));
     if unplaced == 0 {
@@ -387,6 +394,12 @@ fn do_incremental_place(log: &mut Log, d: &Design, v: &Vars, ipv: &IpVars, o: ne
     Ok(Outcome::Placed(common, bases, locations, iter, Vec::new()))
 }
 
+/// `doIncrementalPlace`'s `total_placeable_insts_ == 0`: no region (the top level or a group's)
+/// has a placeable instance.
+fn no_placeable_instances(place_counts: &[usize]) -> bool {
+    place_counts.iter().sum::<usize>() == 0
+}
+
 /// `checkHasCoreRows` (`dbHasCoreRows`: a row whose site is not a PAD site).
 fn check_has_core_rows(log: &mut Log, d: &Design) -> Res<()> {
     if !d.rows.iter().any(|r| !r.1) {
@@ -401,6 +414,17 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    // Rule (`Replace::doIncrementalPlace`, PR 11560 at the pin): the placeable instances are
+    // counted over EVERY region; only when all are empty does -incremental stop with GPL-0139
+    // (witness: correlation variant incremental-all-fixed, the reference at 4155ac31).
+    #[test]
+    fn incremental_skips_only_when_no_region_has_a_placeable_instance() {
+        assert!(no_placeable_instances(&[0]));
+        assert!(no_placeable_instances(&[0, 0]));
+        assert!(!no_placeable_instances(&[0, 3]), "a group region still has instances");
+        assert!(!no_placeable_instances(&[2]));
     }
 
     // Rule (replace.tcl's global_placement, 4155ac3): -place_ios refuses -skip_io (GPL-0169),
