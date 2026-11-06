@@ -714,6 +714,9 @@ pub struct Nesterov {
     is_min_hpwl: bool,
     diverge_snapshot_iter: i32,
     diverge_snapshot_overflow: f32,
+    /// `routability_settle_wait_start_iter_`: the iteration routability's end began waiting for
+    /// the cells to settle, -1 when not waiting.
+    routability_settle_wait_start_iter: i32,
     num_region_diverged: i32,
     diverge: Option<(u32, &'static str)>,
     /// `allow_divergence_recovery_`: a divergence warns and the loop returns, instead of an
@@ -861,6 +864,7 @@ pub fn init_nesterov_place(log: &mut Log, d: &Design, c: &mut Common, ip: &mut I
         is_min_hpwl: false,
         diverge_snapshot_iter: 0,
         diverge_snapshot_overflow: 0.0,
+        routability_settle_wait_start_iter: -1,
         num_region_diverged: 0,
         diverge: None,
         allow_divergence_recovery: false,
@@ -2986,41 +2990,115 @@ impl Nesterov {
         nb.is_diverged
     }
 
-    /// `NesterovPlace::isDiverged`: the snapshot of every region at each new minimum HPWL; on a
-    /// divergence in any region, every region back to it (GPL-0998/0999) when one was saved, else
-    /// an error at the end (GPL-0307).
-    fn np_is_diverged(&mut self, log: &mut Log, saved: &mut bool, snap: &mut (f32, f32)) -> bool {
+    /// `NesterovBase::resetMinSumOverflow`: the divergence test's minimum overflow (and the HPWL
+    /// it had) forgotten.
+    fn reset_min_sum_overflow(&mut self, b: usize) {
+        self.nbs[b].min_sum_overflow = 1e30;
+        self.nbs[b].hpwl_with_min_sum_overflow = 1e30;
+    }
+
+    /// `NesterovPlace::isDiverged`, the pin's rule (#11560: 4d5ef197aa, 50b3821003, 405fde5275,
+    /// 4cdc53a902; unchanged 4155ac31..a6e7f507). Every region's divergence test; with none, the
+    /// min-HPWL snapshot of every region is taken at a new minimum — only once routability is off,
+    /// since it shares the routability snapshot's buffer. On a divergence, in order: the
+    /// routability recovery ([`Self::try_routability_diverge_recovery`], resume); else, with a
+    /// min-HPWL snapshot saved and fewer than 3 reverts, revert to it and RESUME (GPL-0998, then
+    /// GPL-0999), momentum reset, and a further revert only after a new snapshot; else, after an
+    /// earlier revert, revert once more and STOP (GPL-0997); else stop with GPL-0307 at the end.
+    /// Before #11560 every divergence reverted and stopped.
+    fn np_is_diverged(&mut self, log: &mut Log, d: &Design, s: &mut LoopSnapshots, cur_a: &mut f32, route: Option<&mut Routability<'_>>) -> DivergeAction {
         self.num_region_diverged = 0;
         for b in 0..self.nbs.len() {
             self.num_region_diverged += i32::from(self.check_divergence(log, b));
         }
-        // no divergence snapshot while routability may still revert to its own
-        let routability_settled = self.o.routability.is_none() || !self.routability_need;
-        if !self.o.disable_revert_if_diverge && self.num_region_diverged == 0 && routability_settled && self.is_min_hpwl {
-            *snap = (self.wl_coef_x, self.wl_coef_y);
+        let routability_off = self.o.routability.is_none() || !self.routability_need;
+        if self.num_region_diverged == 0 && self.is_min_hpwl && !self.o.disable_revert_if_diverge && routability_off {
+            s.diverge_coef = (self.wl_coef_x, self.wl_coef_y);
+            s.diverge_hpwl = self.min_hpwl;
             for b in 0..self.nbs.len() {
                 self.save_snapshot(log, b);
             }
-            *saved = true;
+            s.diverge_saved = true;
         }
-        if self.num_region_diverged > 0 {
-            log.report(format!("Divergence occured in {} regions.", self.num_region_diverged));
-            if !self.o.disable_revert_if_diverge && *saved {
-                log.warn("GPL", 998, "Divergence detected, reverting to snapshot with min hpwl.");
-                log.warn("GPL", 999, format!("Revert to iter: {:4} overflow: {:.3} HPWL: {}", self.diverge_snapshot_iter, self.diverge_snapshot_overflow, self.min_hpwl));
-                self.wl_coef_x = snap.0;
-                self.wl_coef_y = snap.1;
-                self.update_wirelength_force_wa();
-                for b in 0..self.nbs.len() {
-                    self.revert_to_snapshot(log, b);
-                }
+        if self.num_region_diverged == 0 {
+            return DivergeAction::None;
+        }
+        log.report(format!("Divergence occured in {} regions.", self.num_region_diverged));
+        if !self.o.disable_revert_if_diverge && self.try_routability_diverge_recovery(log, d, s, cur_a, route) {
+            self.num_region_diverged = 0;
+            return DivergeAction::Resume;
+        }
+        match diverge_fallback(s, self.o.disable_revert_if_diverge) {
+            DivergeFallback::RevertAndResume => {
+                s.diverge_reverts += 1;
+                log.warn("GPL", 998, format!("Divergence detected, reverting to snapshot with min hpwl and resuming ({} of {} reverts allowed).", s.diverge_reverts, MAX_DIVERGE_REVERTS));
+                self.revert_to_diverge_snapshot(log, s);
+                *cur_a = 1.0;
+                s.diverge_saved = false;
                 self.num_region_diverged = 0;
-            } else {
-                self.diverge = Some((307, "RePlAce divergence detected: Current overflow is low and increasing relative to minimum,and the HPWL has significantly worsened. Consider re-running with a smaller max_phi_cof value."));
+                DivergeAction::Resume
             }
-            return true;
+            DivergeFallback::RevertAndStop => {
+                log.warn("GPL", 997, "Divergence detected again, reverting to snapshot with min hpwl and stopping.");
+                self.revert_to_diverge_snapshot(log, s);
+                self.num_region_diverged = 0;
+                DivergeAction::Stop
+            }
+            DivergeFallback::Error => {
+                self.diverge = Some((307, "RePlAce divergence detected: Current overflow is low and increasing relative to minimum,and the HPWL has significantly worsened. Consider re-running with a smaller max_phi_cof value."));
+                DivergeAction::Stop
+            }
         }
-        false
+    }
+
+    /// `tryRoutabilityDivergeRecovery` (the pin's, #11560 + a8c132150a): with the routability
+    /// snapshot saved and fewer than 2 attempts — and, once routability is off, no min-HPWL
+    /// snapshot or revert yet (they share the buffer) — revert to the routability snapshot
+    /// (GPL-0112): the sizes back to the minimum-congestion pass while routability is still on,
+    /// routability off at the last attempt (at once when already off), the snapshot's WA
+    /// coefficients, every region reverted with its minimum overflow forgotten, momentum reset, the
+    /// settle wait and the HPWL minimum cleared.
+    fn try_routability_diverge_recovery(&mut self, log: &mut Log, d: &Design, s: &mut LoopSnapshots, cur_a: &mut f32, route: Option<&mut Routability<'_>>) -> bool {
+        let Some(attempt) = routability_recovery_attempt(s, self.routability_need) else {
+            return false;
+        };
+        s.route_attempts = attempt;
+        let last = s.route_attempts == MAX_ROUTABILITY_DIVERGE_ATTEMPTS;
+        if self.routability_need {
+            if let Some(r) = route {
+                self.revert_to_min_congestion(log, d, &mut r.rb, r.common);
+            }
+        }
+        if last {
+            self.routability_need = false;
+        }
+        log.warn("GPL", 112, format!("Divergence detected, reverting to the routability snapshot (attempt {} of {}), further inflation {}.", s.route_attempts, MAX_ROUTABILITY_DIVERGE_ATTEMPTS, if last { "disabled" } else { "still allowed" }));
+        self.wl_coef_x = s.route_coef.0;
+        self.wl_coef_y = s.route_coef.1;
+        self.update_wirelength_force_wa();
+        for b in 0..self.nbs.len() {
+            self.revert_to_snapshot(log, b);
+            self.reset_min_sum_overflow(b);
+        }
+        *cur_a = 1.0;
+        self.routability_settle_wait_start_iter = -1;
+        self.min_hpwl = i64::MAX;
+        self.is_min_hpwl = false;
+        true
+    }
+
+    /// `revertToDivergeSnapshot`: GPL-0999 with the minimum's iteration and overflow and the HPWL
+    /// saved with the snapshot, its WA coefficients, every region reverted with its minimum
+    /// overflow forgotten.
+    fn revert_to_diverge_snapshot(&mut self, log: &mut Log, s: &LoopSnapshots) {
+        log.warn("GPL", 999, format!("Revert to iter: {:4} overflow: {:.3} HPWL: {}", self.diverge_snapshot_iter, self.diverge_snapshot_overflow, s.diverge_hpwl));
+        self.wl_coef_x = s.diverge_coef.0;
+        self.wl_coef_y = s.diverge_coef.1;
+        self.update_wirelength_force_wa();
+        for b in 0..self.nbs.len() {
+            self.revert_to_snapshot(log, b);
+            self.reset_min_sum_overflow(b);
+        }
     }
 
     /// `NesterovBase::checkConvergence`: at the target overflow, the closing row (a region's named),
@@ -4216,6 +4294,71 @@ pub struct Routability<'a> {
     pub common: &'a Common,
 }
 
+/// `NesterovPlace::DivergeAction`: what the loop does after the divergence test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DivergeAction {
+    None,
+    Resume,
+    Stop,
+}
+
+/// `kMaxDivergeReverts`, `kMaxRoutabilityDivergeAttempts`.
+const MAX_DIVERGE_REVERTS: i32 = 3;
+const MAX_ROUTABILITY_DIVERGE_ATTEMPTS: i32 = 2;
+
+/// `tryRoutabilityDivergeRecovery`'s gate and count: none without the routability snapshot or
+/// after 2 attempts, none once routability is off if the min-HPWL snapshot (which overwrote the
+/// shared buffer) was saved or reverted to; else the attempt number, straight to the last when
+/// routability is already off (a second attempt would replay the first).
+fn routability_recovery_attempt(s: &LoopSnapshots, routability_need: bool) -> Option<i32> {
+    if !s.route_saved || s.route_attempts >= MAX_ROUTABILITY_DIVERGE_ATTEMPTS {
+        return None;
+    }
+    if !routability_need && (s.diverge_saved || s.diverge_reverts > 0) {
+        return None;
+    }
+    Some(if routability_need { s.route_attempts + 1 } else { MAX_ROUTABILITY_DIVERGE_ATTEMPTS })
+}
+
+/// What `isDiverged` does after the routability recovery declined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DivergeFallback {
+    /// GPL-0998: revert to the min-HPWL snapshot and go on.
+    RevertAndResume,
+    /// GPL-0997: revert to it once more and stop.
+    RevertAndStop,
+    /// GPL-0307 at the end.
+    Error,
+}
+
+/// `isDiverged`'s fallback order: with reverts allowed, a saved min-HPWL snapshot and fewer than 3
+/// reverts resumes; any earlier revert stops at the snapshot; otherwise (or reverts disabled) the
+/// divergence is an error.
+fn diverge_fallback(s: &LoopSnapshots, disable_revert: bool) -> DivergeFallback {
+    if !disable_revert && s.diverge_saved && s.diverge_reverts < MAX_DIVERGE_REVERTS {
+        DivergeFallback::RevertAndResume
+    } else if !disable_revert && s.diverge_reverts > 0 {
+        DivergeFallback::RevertAndStop
+    } else {
+        DivergeFallback::Error
+    }
+}
+
+/// The snapshot state `doNesterovPlace` resets at each call: the routability snapshot (saved,
+/// WA coefficients, momentum, recovery attempts) and the min-HPWL one (saved, WA coefficients,
+/// HPWL, reverts).
+#[derive(Debug, Default)]
+struct LoopSnapshots {
+    route_saved: bool,
+    route_coef: (f32, f32),
+    route_a: f32,
+    route_attempts: i32,
+    diverge_saved: bool,
+    diverge_coef: (f32, f32),
+    diverge_hpwl: i64,
+    diverge_reverts: i32,
+}
+
 /// `NesterovPlace::doNesterovPlace(start_iter)` with GPL-0084 before it.
 fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_iter: i32, mut route: Option<&mut Routability<'_>>, mut td: Option<&mut TimingDriven<'_>>) -> Res<i32> {
     log.info("GPL", 84, "---- Execute Nesterov Global Placement.");
@@ -4248,9 +4391,8 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         nb.is_converged = false;
         original_area += nesterov_insts_area(nb);
     }
-    let (mut saved, mut snap) = (false, (0f32, 0f32));
-    // the routability snapshot: saved, its WA coefficients and step parameter
-    let (mut route_saved, mut route_snap, mut route_snap_a) = (false, (0f32, 0f32), 0f32);
+    // the routability and min-HPWL snapshots, reset at each call
+    let mut snaps = LoopSnapshots::default();
     let (mut route_iters, mut route_reverts) = (0i32, 0i32);
     // timing-driven: the reweights run, the area they added
     let (mut td_count, mut td_delta) = (0i32, 0i64);
@@ -4281,7 +4423,7 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         }
         let routability = np.o.routability.is_some();
         // `is_routability_gpl_iter`: each such iteration extends the limit by one
-        let routability_gpl_iter = route_saved && np.average_overflow_unscaled > np.o.routability_end_overflow;
+        let routability_gpl_iter = snaps.route_saved && np.average_overflow_unscaled > np.o.routability_end_overflow;
         if routability_gpl_iter {
             route_iters += 1;
             np.max_iter += 1;
@@ -4292,14 +4434,20 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
                 np.run_timing_driven(log, d, t, iter, &mut td_count, &mut td_delta)?;
             }
         }
-        if np.np_is_diverged(log, &mut saved, &mut snap) {
-            break;
+        match np.np_is_diverged(log, d, &mut snaps, &mut cur_a, route.as_deref_mut()) {
+            DivergeAction::Stop => break,
+            // the reverted placement goes on from the next iteration
+            DivergeAction::Resume => {
+                iter += 1;
+                continue;
+            }
+            DivergeAction::None => {}
         }
         // `routabilitySnapshot`
-        if routability && !route_saved && np.o.routability_snapshot_overflow >= np.average_overflow_unscaled {
-            route_snap = (np.wl_coef_x, np.wl_coef_y);
-            route_snap_a = cur_a;
-            route_saved = true;
+        if routability && !snaps.route_saved && np.o.routability_snapshot_overflow >= np.average_overflow_unscaled {
+            snaps.route_coef = (np.wl_coef_x, np.wl_coef_y);
+            snaps.route_a = cur_a;
+            snaps.route_saved = true;
             for b in 0..np.nbs.len() {
                 np.save_snapshot(log, b);
             }
@@ -4320,14 +4468,13 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
                 np.min_hpwl = i64::MAX;
                 np.is_min_hpwl = false;
                 if need || revert_init {
-                    cur_a = route_snap_a;
-                    np.wl_coef_x = route_snap.0;
-                    np.wl_coef_y = route_snap.1;
+                    cur_a = snaps.route_a;
+                    np.wl_coef_x = snaps.route_coef.0;
+                    np.wl_coef_y = snaps.route_coef.1;
                     np.update_wirelength_force_wa();
                     for b in 0..np.nbs.len() {
                         np.revert_to_snapshot(log, b);
-                        np.nbs[b].min_sum_overflow = 1e30;
-                        np.nbs[b].hpwl_with_min_sum_overflow = 1e30;
+                        np.reset_min_sum_overflow(b);
                     }
                 }
                 if need && revert_init {
@@ -4386,6 +4533,39 @@ fn vyg_dump_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`isDiverged`, #11560 at the pin): a divergence with a saved min-HPWL snapshot
+    /// resumes from it at most 3 times (GPL-0998), a further revert only after a new snapshot;
+    /// once reverted, a divergence with no new snapshot (or a 4th) reverts and STOPS (GPL-0997);
+    /// never reverted and no snapshot, or reverts disabled, is GPL-0307. Before the pin every
+    /// divergence reverted and stopped.
+    #[test]
+    fn a_divergence_resumes_from_the_min_hpwl_snapshot_up_to_three_times() {
+        let s = |saved, reverts| LoopSnapshots { diverge_saved: saved, diverge_reverts: reverts, ..LoopSnapshots::default() };
+        assert_eq!(diverge_fallback(&s(true, 0), false), DivergeFallback::RevertAndResume);
+        assert_eq!(diverge_fallback(&s(true, 2), false), DivergeFallback::RevertAndResume);
+        assert_eq!(diverge_fallback(&s(true, 3), false), DivergeFallback::RevertAndStop, "a 4th revert stops");
+        assert_eq!(diverge_fallback(&s(false, 1), false), DivergeFallback::RevertAndStop, "no new snapshot since the revert");
+        assert_eq!(diverge_fallback(&s(false, 0), false), DivergeFallback::Error);
+        assert_eq!(diverge_fallback(&s(true, 0), true), DivergeFallback::Error, "-disable_revert_if_diverge");
+        assert_eq!(diverge_fallback(&s(false, 1), true), DivergeFallback::Error);
+    }
+
+    /// Upstream rule (`tryRoutabilityDivergeRecovery`, #11560 + a8c132150a): only with the
+    /// routability snapshot saved, at most 2 attempts; with routability on, attempts 1 then 2; with
+    /// routability off, straight to the last attempt, and none at all once the min-HPWL snapshot
+    /// (sharing the buffer) was saved or reverted to.
+    #[test]
+    fn the_routability_recovery_is_tried_twice_and_never_over_a_min_hpwl_snapshot() {
+        let s = |route_saved, attempts, saved, reverts| LoopSnapshots { route_saved, route_attempts: attempts, diverge_saved: saved, diverge_reverts: reverts, ..LoopSnapshots::default() };
+        assert_eq!(routability_recovery_attempt(&s(false, 0, false, 0), true), None, "no routability snapshot");
+        assert_eq!(routability_recovery_attempt(&s(true, 0, false, 0), true), Some(1));
+        assert_eq!(routability_recovery_attempt(&s(true, 1, true, 0), true), Some(2), "routability on: the min-HPWL snapshot is not consulted");
+        assert_eq!(routability_recovery_attempt(&s(true, 2, false, 0), true), None, "two attempts made");
+        assert_eq!(routability_recovery_attempt(&s(true, 0, false, 0), false), Some(MAX_ROUTABILITY_DIVERGE_ATTEMPTS), "off: the last at once");
+        assert_eq!(routability_recovery_attempt(&s(true, 0, true, 0), false), None);
+        assert_eq!(routability_recovery_attempt(&s(true, 0, false, 1), false), None);
+    }
 
     /// Upstream rule (4155ac3 `FFT::init`): `wx = PI * i / binCntX`; `wy = PI * i / binCntY *
     /// binSizeY / binSizeX` (#12051, after the pin, inverts the bin ratio). Square bins: the two
