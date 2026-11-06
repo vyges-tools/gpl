@@ -3220,6 +3220,14 @@ pub struct TimingDriven<'a> {
     pub pad_right: i32,
 }
 
+/// `fixPointers`, the pin's rule (upstream PR 11560, unchanged 4155ac31..a6e7f507): a cell's
+/// terminal that has a placer pin (`db_iterm_to_index_map_`) but now sits on a net with no placer
+/// net (the resizer moved it to one gpl does not place: a supply or special net) is GPL-0335; a
+/// terminal on no net is skipped. Before the pin the pin was silently kept on its old net.
+fn pin_on_unplaced_net(has_gpin: bool, net_has_gnet: bool) -> bool {
+    has_gpin && !net_has_gnet
+}
+
 /// `NesterovBaseCommon::createCbkGCell` for an instance the resizer creates and removes again in
 /// the same call (`inDbInstCreate` … `inDbInstDestroy`; repair_design's `fanout1` that
 /// `fullyRebuffer` then removes): the callback still makes its cell — `Instance(db_inst)` at
@@ -3257,7 +3265,7 @@ impl Nesterov {
     /// the new pins, then every cell's pins (its terminals in order), every pin's cell and net,
     /// and every net's pins (its terminals, then its ports) again from the design. An instance
     /// resized, or created and destroyed in the one call, is refused.
-    fn absorb_netlist(&mut self, old: &Design, new: &Design, report: &crate::timing_driven::ResizeReport, c: &mut Common, pad_right: i32) -> Res<Absorbed> {
+    fn absorb_netlist(&mut self, log: &mut Log, old: &Design, new: &Design, report: &crate::timing_driven::ResizeReport, c: &mut Common, pad_right: i32) -> Res<Absorbed> {
         let events = &report.events;
         let new_ix: HashMap<&str, usize> = new.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
         let old_names: std::collections::HashSet<&str> = old.insts.iter().map(|x| x.name.as_str()).collect();
@@ -3470,6 +3478,16 @@ impl Nesterov {
         for v in inst_terms.values_mut() {
             v.sort_by_key(|x| x.0);
         }
+        // every terminal on any net, in its instance's order: `fixPointers` reads them all
+        let mut all_terms: HashMap<usize, Vec<(usize, usize, &str)>> = HashMap::new();
+        for (k, n) in new.nets.iter().enumerate() {
+            for t in &n.iterms {
+                all_terms.entry(t.inst).or_default().push((t.order, k, t.mterm.as_str()));
+            }
+        }
+        for v in all_terms.values_mut() {
+            v.sort_by_key(|x| x.0);
+        }
         let cell_of_db: HashMap<usize, usize> = self.gcells.iter().enumerate().filter_map(|(gi, g)| g.inst.and_then(|k| c.insts[k].db).map(|db| (db, gi))).collect();
         for (k, di) in new.insts.iter().enumerate() {
             if old_names.contains(di.name.as_str()) {
@@ -3491,8 +3509,12 @@ impl Nesterov {
             for m in members {
                 let Some(db) = c.insts[m].db else { continue };
                 let name = &new.insts[db].name;
-                for &(order, _, _) in inst_terms.get(&db).map(Vec::as_slice).unwrap_or(&[]) {
+                for &(order, k, mterm) in all_terms.get(&db).map(Vec::as_slice).unwrap_or(&[]) {
                     if let Some(&p) = key_ix.get(&PinKey::Inst(name.clone(), order)) {
+                        if pin_on_unplaced_net(true, gnet_of_design.contains_key(&k)) {
+                            let n = &new.nets[k];
+                            return log.error("GPL", 335, format!("Pin {name}/{mterm} is on net {} ({}), which global placement does not place.", n.name, n.sig_type));
+                        }
                         pins.push(p);
                         self.gpins[p].gcell = Some(gi);
                     }
@@ -3661,7 +3683,7 @@ impl Nesterov {
         for l in &report.lines {
             log.relay(l);
         }
-        let absorbed = self.absorb_netlist(&td.design, &report.design, &report, td.common, td.pad_right)?;
+        let absorbed = self.absorb_netlist(log, &td.design, &report.design, &report, td.common, td.pad_right)?;
         td.design = report.design;
         let proceed = self.timing_weights(log, &report.slacks, td.common, &td.design, &td.state);
         let _ = d;
@@ -4644,6 +4666,16 @@ mod tests {
         assert!(!take(100, false, &s(false, 0, 90), 0.1, 0.2, 100), "no snapshot");
         assert!(!take(100, false, &s(true, 0, 90), 0.3, 0.2, 100), "snapshot overflow worse");
         assert!(!take(100, false, &s(true, 0, 100), 0.1, 0.2, 100), "HPWL not strictly lower");
+    }
+
+    /// Upstream rule (`fixPointers`, PR 11560 at the pin): a terminal with a placer pin on a net
+    /// gpl places keeps its pin; with a pin on a net gpl does not place it is GPL-0335; a terminal
+    /// that never had a pin (a supply pin) is not asked.
+    #[test]
+    fn a_placer_pin_moved_to_a_net_gpl_does_not_place_is_an_error() {
+        assert!(!pin_on_unplaced_net(true, true));
+        assert!(pin_on_unplaced_net(true, false));
+        assert!(!pin_on_unplaced_net(false, false));
     }
 
     /// Upstream rule (`runRoutability`, d5336340f4/81764ed411): the first iteration at routability's

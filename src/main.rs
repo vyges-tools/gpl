@@ -134,7 +134,7 @@ fn design(db: &Db) -> Res<Design> {
                 }
             }
             let order = mterm_order.get(&(master.clone(), p.to_string())).copied().unwrap_or(usize::MAX);
-            iterms.push(Term { inst: k, shape, order });
+            iterms.push(Term { inst: k, shape, order, mterm: p.to_string() });
         }
         let bterms = db
             .net_get_b_terms(&name)
@@ -145,7 +145,7 @@ fn design(db: &Db) -> Res<Design> {
                 Port { bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), name: b, fixed }
             })
             .collect();
-        d.nets.push(DbNet { signal_or_clock: sig == "SIGNAL" || sig == "CLOCK", iterms, bterms, name });
+        d.nets.push(DbNet { signal_or_clock: sig == "SIGNAL" || sig == "CLOCK", sig_type: sig, iterms, bterms, name });
     }
     let boxes = db.blockage_boxes().map_err(e)?;
     for (k, (lx, ly, ux, uy)) in boxes.into_iter().enumerate() {

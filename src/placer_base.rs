@@ -166,6 +166,8 @@ pub struct Term {
     pub shape: Option<Rect>,
     /// Its position among its instance's terminals (`dbInst::getITerms`: master terminal order).
     pub order: usize,
+    /// Its master terminal's name (`dbITerm::getName` is `<inst>/<mterm>`).
+    pub mterm: String,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +175,8 @@ pub struct DbNet {
     pub name: String,
     /// `SIGNAL` or `CLOCK` (the others are skipped).
     pub signal_or_clock: bool,
+    /// `dbNet::getSigType` as written (GPL-0335 names it).
+    pub sig_type: String,
     /// The net's terminals in `getITerms()` order.
     pub iterms: Vec<Term>,
     pub bterms: Vec<Port>,
