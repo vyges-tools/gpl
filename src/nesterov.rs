@@ -4344,6 +4344,14 @@ fn diverge_fallback(s: &LoopSnapshots, disable_revert: bool) -> DivergeFallback 
     }
 }
 
+/// After the loop, the pin's rule (upstream e27117b72a, unchanged 4155ac31..a6e7f507): a loop that
+/// ran out of iterations (unlike a divergence, which says nothing about the final placement) takes
+/// the min-HPWL snapshot (GPL-0121) only when reverts are on, a snapshot was saved or reverted to,
+/// its overflow is no worse than the current one, and its HPWL is strictly lower.
+fn max_iter_takes_min_hpwl_snapshot(iter: i32, max_iter: i32, disable_revert: bool, s: &LoopSnapshots, snapshot_overflow: f32, overflow: f32, hpwl: i64) -> bool {
+    iter >= max_iter && !disable_revert && (s.diverge_saved || s.diverge_reverts > 0) && snapshot_overflow <= overflow && s.diverge_hpwl < hpwl
+}
+
 /// The snapshot state `doNesterovPlace` resets at each call: the routability snapshot (saved,
 /// WA coefficients, momentum, recovery attempts) and the min-HPWL one (saved, WA coefficients,
 /// HPWL, reverts).
@@ -4493,6 +4501,11 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         }
         iter += 1;
     }
+    // a loop that ran out of iterations takes the min-HPWL snapshot when no worse (upstream e27117b72a)
+    if max_iter_takes_min_hpwl_snapshot(iter, np.max_iter, np.o.disable_revert_if_diverge, &snaps, np.diverge_snapshot_overflow, np.average_overflow_unscaled, np.hpwl()) {
+        log.warn("GPL", 121, "Reached the maximum number of iterations, reverting to snapshot with min hpwl.");
+        np.revert_to_diverge_snapshot(log, &snaps);
+    }
     // `reportResults`.
     if iter >= np.max_iter {
         log.warn("GPL", 1010, format!("GPL reached the maximum number of iterations for nesterov {}. Placement may have failed to converge.", np.max_iter));
@@ -4565,6 +4578,22 @@ mod tests {
         assert_eq!(routability_recovery_attempt(&s(true, 0, false, 0), false), Some(MAX_ROUTABILITY_DIVERGE_ATTEMPTS), "off: the last at once");
         assert_eq!(routability_recovery_attempt(&s(true, 0, true, 0), false), None);
         assert_eq!(routability_recovery_attempt(&s(true, 0, false, 1), false), None);
+    }
+
+    /// Upstream rule (`doNesterovPlace`, e27117b72a): out of iterations, the min-HPWL snapshot is
+    /// taken (GPL-0121) only with one saved (or reverted to), an overflow no worse and an HPWL
+    /// strictly better; converging before the limit, or reverts disabled, never.
+    #[test]
+    fn running_out_of_iterations_takes_a_better_min_hpwl_snapshot_only() {
+        let s = |saved, reverts, hpwl| LoopSnapshots { diverge_saved: saved, diverge_reverts: reverts, diverge_hpwl: hpwl, ..LoopSnapshots::default() };
+        let take = |iter, disable, snap: &LoopSnapshots, snap_ov, ov, hpwl| max_iter_takes_min_hpwl_snapshot(iter, 100, disable, snap, snap_ov, ov, hpwl);
+        assert!(take(100, false, &s(true, 0, 90), 0.1, 0.1, 100), "equal overflow, lower HPWL");
+        assert!(take(100, false, &s(false, 1, 90), 0.1, 0.2, 100), "reverted earlier, no new snapshot");
+        assert!(!take(99, false, &s(true, 0, 90), 0.1, 0.2, 100), "converged before the limit");
+        assert!(!take(100, true, &s(true, 0, 90), 0.1, 0.2, 100), "-disable_revert_if_diverge");
+        assert!(!take(100, false, &s(false, 0, 90), 0.1, 0.2, 100), "no snapshot");
+        assert!(!take(100, false, &s(true, 0, 90), 0.3, 0.2, 100), "snapshot overflow worse");
+        assert!(!take(100, false, &s(true, 0, 100), 0.1, 0.2, 100), "HPWL not strictly lower");
     }
 
     /// Upstream rule (4155ac3 `FFT::init`): `wx = PI * i / binCntX`; `wy = PI * i / binCntY *
