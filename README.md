@@ -1,7 +1,5 @@
 # vyges-gpl
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Global placement. The engine builds the placer's view of the design — instances, nets, pins,
 regions, the sites a placement may not use — runs the initial placement (rounds of a
 bound-to-bound net model solved by BiCGSTAB, in exactly the arithmetic order of the reference
