@@ -344,6 +344,17 @@ fn bivariate_normal_cdf(mean_x: f32, mean_y: f32, sigma_x: f32, sigma_y: f32, lx
     (0.25 * f64::from(s)) as f32
 }
 
+/// The divergence snapshot's minimum HPWL after a non-virtual timing-driven pass: the pass's HPWL
+/// at overflow 0.25 or under; above it, forgotten (`i64::MAX`, no minimum — OpenROAD #12068 in the
+/// f11b4276 pin; at 4155ac31 the earlier minimum was kept).
+fn td_min_hpwl(overflow: f32, hpwl: i64) -> (i64, bool) {
+    if f64::from(overflow) <= 0.25 {
+        (hpwl, true)
+    } else {
+        (i64::MAX, false)
+    }
+}
+
 /// `nesterovUpdateStepLength`'s rule on (old step, coordinate distance, gradient distance) ->
 /// (new step, accepted, diverged). A moved point whose gradients did not change (a sub-DBU step
 /// leaves the integer-truncated gradients the same) keeps the step and is not accepted — checked
@@ -561,6 +572,16 @@ impl Nb {
             &mut self.cur,
             &mut self.next,
         ]
+    }
+
+    /// `NesterovBase::resetMinSumOverflow`: the divergence tests' memory forgotten — the minimum
+    /// overflow and the HPWL it had, and (OpenROAD #12068, 709551cfaf / 863d566467, in the
+    /// f11b4276 pin) the last reported overflow and HPWL the between-reports test compares against.
+    fn reset_min_sum_overflow(&mut self) {
+        self.min_sum_overflow = 1e30;
+        self.hpwl_with_min_sum_overflow = 1e30;
+        self.prev_reported_overflow_unscaled = 0.0;
+        self.prev_reported_hpwl = 0;
     }
 
     fn snapshots(&mut self) -> [&mut Vec<FloatPoint>; 4] {
@@ -2998,11 +3019,9 @@ impl Nesterov {
         nb.is_diverged
     }
 
-    /// `NesterovBase::resetMinSumOverflow`: the divergence test's minimum overflow (and the HPWL
-    /// it had) forgotten.
+    /// `NesterovBase::resetMinSumOverflow`: see [`Nb::reset_min_sum_overflow`].
     fn reset_min_sum_overflow(&mut self, b: usize) {
-        self.nbs[b].min_sum_overflow = 1e30;
-        self.nbs[b].hpwl_with_min_sum_overflow = 1e30;
+        self.nbs[b].reset_min_sum_overflow();
     }
 
     /// `NesterovPlace::isDiverged`, the pin's rule (#11560: 4d5ef197aa, 50b3821003, 405fde5275,
@@ -3725,14 +3744,18 @@ impl Nesterov {
             created = 0;
             self.update_areas(b);
             update_density_size(&mut self.gcells, &self.nbs[b]);
+            // #12068 (in the f11b4276 pin): the repaired netlist starts the divergence tests over,
+            // its HPWL the previous one
+            let hpwl = self.hpwl();
+            self.nbs[b].reset_min_sum_overflow();
+            self.nbs[b].prev_hpwl = hpwl;
         }
         self.refresh_cur_gradients();
         let hpwl = self.hpwl();
-        if f64::from(self.average_overflow_unscaled) <= 0.25 {
-            self.min_hpwl = hpwl;
+        (self.min_hpwl, self.is_min_hpwl) = td_min_hpwl(self.average_overflow_unscaled, hpwl);
+        if self.is_min_hpwl {
             self.diverge_snapshot_overflow = self.average_overflow_unscaled;
             self.diverge_snapshot_iter = iter + 1;
-            self.is_min_hpwl = true;
         }
         // the next iteration restarts the momentum (GPL-0111, upstream af3dfe97f09)
         self.reset_nesterov_momentum = true;
@@ -4697,6 +4720,20 @@ mod tests {
         assert_eq!(settle_wait_step(40, 47, true, true), (-1, SettleWait::Finished(7)));
         assert_eq!(settle_wait_step(-1, 50, true, true), (-1, SettleWait::Nothing), "settled at once");
         assert_eq!(settle_wait_step(-1, 30, false, false), (-1, SettleWait::Nothing), "end not reached");
+    }
+
+    /// Upstream rule (#12068, in the f11b4276 pin): after a non-virtual timing-driven pass the
+    /// min-HPWL snapshot is the pass's at overflow <= 0.25, else forgotten; `resetMinSumOverflow`
+    /// also forgets the last reported overflow and HPWL.
+    #[test]
+    fn a_timing_driven_pass_restarts_the_divergence_memory() {
+        assert_eq!(td_min_hpwl(0.25, 7), (7, true));
+        assert_eq!(td_min_hpwl(0.3, 7), (i64::MAX, false), "above 0.25: no minimum");
+        let base = Base { group: None, region_bbox: crate::placer_base::Rect { lx: 0, ly: 0, ux: 10, uy: 10 }, region_area: 100, place_insts: vec![], fixed_insts: vec![], dummies: vec![], place_insts_area: 0, non_place_insts_area: 0, std_insts_area: 0, macro_insts_area: 0 };
+        let mut nb = Nb::new(&base, None, &Opts::default());
+        (nb.min_sum_overflow, nb.hpwl_with_min_sum_overflow, nb.prev_reported_overflow_unscaled, nb.prev_reported_hpwl) = (0.1, 5.0, 0.3, 9);
+        nb.reset_min_sum_overflow();
+        assert_eq!((nb.min_sum_overflow, nb.hpwl_with_min_sum_overflow, nb.prev_reported_overflow_unscaled, nb.prev_reported_hpwl), (1e30, 1e30, 0.0, 0));
     }
 
     /// Upstream rule (`nesterovUpdateStepLength`, #12064 in the f11b4276 pin): gradients unchanged
