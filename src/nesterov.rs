@@ -329,11 +329,9 @@ fn distance(a: &[FloatPoint], b: &[FloatPoint]) -> f32 {
     (f64::from(sum) / (2.0 * n as f64)).sqrt() as f32
 }
 
-extern "C" {
-    fn erff(x: f32) -> f32;
-}
-
-/// `calculateBiVariateNormalCDF` (float `erf`, the `√2` a double).
+/// `calculateBiVariateNormalCDF` (the `√2` a double). The error function is CORE-MATH's correctly
+/// rounded `cr_erff` since the f11b4276 pin (OpenROAD #12388): at 4155ac31 it was the C library's
+/// `erff`, whose last bit depends on the host's libm.
 #[allow(clippy::too_many_arguments)]
 fn bivariate_normal_cdf(mean_x: f32, mean_y: f32, sigma_x: f32, sigma_y: f32, lx: f32, ly: f32, ux: f32, uy: f32) -> f32 {
     let s2 = 2f64.sqrt();
@@ -341,8 +339,7 @@ fn bivariate_normal_cdf(mean_x: f32, mean_y: f32, sigma_x: f32, sigma_y: f32, lx
     let x2 = (f64::from(mean_x - ux) / (s2 * f64::from(sigma_x))) as f32;
     let y1 = (f64::from(mean_y - ly) / (s2 * f64::from(sigma_y))) as f32;
     let y2 = (f64::from(mean_y - uy) / (s2 * f64::from(sigma_y))) as f32;
-    // SAFETY: `erff` is the C library's pure function of one float.
-    let erf = |v: f32| unsafe { erff(v) };
+    let erf = crate::core_math_erff::cr_erff;
     let s = erf(x1) * erf(y1) + erf(x2) * erf(y2) - erf(x1) * erf(y2) - erf(x2) * erf(y1);
     (0.25 * f64::from(s)) as f32
 }

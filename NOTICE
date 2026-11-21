@@ -21,3 +21,6 @@ This engine reads and writes the design database through vyges-opendb, which lin
 library (libodb). A binary built from this source embeds libodb, which is
 Copyright (c) 2019-2025, The OpenROAD Authors, and is used under the BSD 3-Clause License; a
 redistributor of such a binary carries that notice and license text with it (see vyges-opendb-lib).
+
+This product includes a transcription of CORE-MATH's correctly rounded erff, Copyright (c) 2022-2025
+Alexei Sibidanov, used under the MIT License (see THIRD_PARTY_LICENSES.md).

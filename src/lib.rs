@@ -15,6 +15,7 @@
 extern crate self as vyges_gpl;
 
 pub mod bicgstab;
+pub mod core_math_erff;
 #[cfg(feature = "cli")]
 pub mod db_router;
 pub mod initial_place;
