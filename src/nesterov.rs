@@ -344,6 +344,15 @@ fn bivariate_normal_cdf(mean_x: f32, mean_y: f32, sigma_x: f32, sigma_y: f32, lx
     (0.25 * f64::from(s)) as f32
 }
 
+/// `NesterovPlace::isRoutabilityGplIter` (OpenROAD #12214, 3bd6bdedfb, in the f11b4276 pin): once
+/// the routability snapshot is saved, while the overflow is above the routability end overflow OR a
+/// routability pass is still pending. At 4155ac31 only the overflow test: the wait for the placement
+/// to settle before a pending pass was not a routability iteration (no extra iteration, and timing-
+/// driven could fire and have its repair discarded by the pending revert).
+fn is_routability_gpl_iter(snapshot_saved: bool, routability_need: bool, overflow: f32, end_overflow: f32) -> bool {
+    snapshot_saved && (routability_need || overflow > end_overflow)
+}
+
 /// The divergence snapshot's minimum HPWL after a non-virtual timing-driven pass: the pass's HPWL
 /// at overflow 0.25 or under; above it, forgotten (`i64::MAX`, no minimum — OpenROAD #12068 in the
 /// f11b4276 pin; at 4155ac31 the earlier minimum was kept).
@@ -3611,6 +3620,13 @@ impl Nesterov {
                 nb.cur_slp[i] = pt;
                 nb.prev_slp[i] = pt;
                 nb.cur[i] = pt;
+                // #12214 (f52ff7b14e, in the f11b4276 pin): the snapshot slots too, so a revert
+                // after the pass puts a new cell where it was made (our snapshot vectors exist
+                // only once a snapshot was taken; upstream sizes them at init)
+                if nb.snapshot.len() > i {
+                    nb.snapshot[i] = pt;
+                    nb.snapshot_slp[i] = pt;
+                }
             }
         }
     }
@@ -4531,7 +4547,7 @@ fn resume_nesterov_place(log: &mut Log, d: &Design, np: &mut Nesterov, start_ite
         }
         let routability = np.o.routability.is_some();
         // `is_routability_gpl_iter`: each such iteration extends the limit by one
-        let routability_gpl_iter = snaps.route_saved && np.average_overflow_unscaled > np.o.routability_end_overflow;
+        let routability_gpl_iter = is_routability_gpl_iter(snaps.route_saved, np.routability_need, np.average_overflow_unscaled, np.o.routability_end_overflow);
         if routability_gpl_iter {
             route_iters += 1;
             np.max_iter += 1;
@@ -4720,6 +4736,16 @@ mod tests {
         assert_eq!(settle_wait_step(40, 47, true, true), (-1, SettleWait::Finished(7)));
         assert_eq!(settle_wait_step(-1, 50, true, true), (-1, SettleWait::Nothing), "settled at once");
         assert_eq!(settle_wait_step(-1, 30, false, false), (-1, SettleWait::Nothing), "end not reached");
+    }
+
+    /// Upstream rule (`isRoutabilityGplIter`, #12214 in the f11b4276 pin): a pending routability
+    /// pass keeps an iteration a routability one below the end overflow; nothing before the snapshot.
+    #[test]
+    fn a_pending_routability_pass_is_a_routability_iteration() {
+        assert!(is_routability_gpl_iter(true, true, 0.1, 0.3), "pending, below the end overflow");
+        assert!(is_routability_gpl_iter(true, false, 0.4, 0.3));
+        assert!(!is_routability_gpl_iter(true, false, 0.2, 0.3));
+        assert!(!is_routability_gpl_iter(false, true, 0.9, 0.3), "no snapshot yet");
     }
 
     /// Upstream rule (#12068, in the f11b4276 pin): after a non-virtual timing-driven pass the
