@@ -344,6 +344,29 @@ fn bivariate_normal_cdf(mean_x: f32, mean_y: f32, sigma_x: f32, sigma_y: f32, lx
     (0.25 * f64::from(s)) as f32
 }
 
+/// `nesterovUpdateStepLength`'s rule on (old step, coordinate distance, gradient distance) ->
+/// (new step, accepted, diverged). A moved point whose gradients did not change (a sub-DBU step
+/// leaves the integer-truncated gradients the same) keeps the step and is not accepted — checked
+/// before the NaN/inf divergence test (OpenROAD #12064, in the f11b4276 pin; at 4155ac31 the 1/0
+/// diverged). Else a NaN/inf new step diverges; a new step over 0.95 of the old (in double) is
+/// taken, not accepted; one under 0.01 is clamped to 0.01, not accepted; else taken and accepted.
+fn step_length_rule(old: f32, coordi: f32, grad: f32) -> (f32, bool, bool) {
+    let new = coordi / grad;
+    if grad == 0.0 && coordi > 0.0 {
+        return (old, false, false);
+    }
+    if new.is_nan() || new.is_infinite() {
+        return (old, false, true);
+    }
+    if f64::from(new) > f64::from(old) * 0.95 {
+        return (new, false, false);
+    }
+    if f64::from(new) < 0.01 {
+        return (0.01f64 as f32, false, false);
+    }
+    (new, true, false)
+}
+
 /// `FFT::init`'s x wavenumber (CPU backend, extended precision): `PI * i / binCntX`.
 fn wavenumber_x(i: usize, nx: i32) -> f32 {
     ld::PI.times(Ld::from_f32(i as f32)).over(Ld::from_f32(nx as f32)).to_f32()
@@ -2742,8 +2765,7 @@ impl Nesterov {
         self.update_density_field_bin(b);
     }
 
-    /// `nesterovUpdateStepLength`: accept the new step when it is at most 0.95 of the last (in
-    /// double); a step under 0.01 is set to 0.01 and not accepted.
+    /// `nesterovUpdateStepLength`: see [`step_length_rule`].
     fn nesterov_update_step_length(&mut self, b: usize) -> bool {
         let nb = &mut self.nbs[b];
         if nb.is_converged {
@@ -2751,21 +2773,10 @@ impl Nesterov {
         }
         nb.coordi_distance = distance(&nb.cur_slp, &nb.next_slp);
         let grad = distance(&nb.cur_slp_sum, &nb.next_slp_sum);
-        let new = nb.coordi_distance / grad;
-        if new.is_nan() || new.is_infinite() {
-            nb.is_diverged = true;
-            return false;
-        }
-        if f64::from(new) > f64::from(nb.step_length) * 0.95 {
-            nb.step_length = new;
-            return false;
-        }
-        if f64::from(new) < 0.01 {
-            nb.step_length = 0.01f64 as f32;
-            return false;
-        }
-        nb.step_length = new;
-        true
+        let (step, accepted, diverged) = step_length_rule(nb.step_length, nb.coordi_distance, grad);
+        nb.step_length = step;
+        nb.is_diverged |= diverged;
+        accepted
     }
 
     /// `NesterovPlace::doBackTracking`: up to ten trial steps, every region each time, until every
@@ -4686,6 +4697,19 @@ mod tests {
         assert_eq!(settle_wait_step(40, 47, true, true), (-1, SettleWait::Finished(7)));
         assert_eq!(settle_wait_step(-1, 50, true, true), (-1, SettleWait::Nothing), "settled at once");
         assert_eq!(settle_wait_step(-1, 30, false, false), (-1, SettleWait::Nothing), "end not reached");
+    }
+
+    /// Upstream rule (`nesterovUpdateStepLength`, #12064 in the f11b4276 pin): gradients unchanged
+    /// by a nonzero move keep the step and do not diverge; a zero move with zero gradient change
+    /// (0/0) still diverges; the 0.95 and 0.01 branches as before.
+    #[test]
+    fn a_move_that_leaves_the_gradients_unchanged_keeps_the_step() {
+        assert_eq!(step_length_rule(0.5, 1e-4, 0.0), (0.5, false, false));
+        assert_eq!(step_length_rule(0.5, 0.0, 0.0), (0.5, false, true), "0/0 diverges");
+        assert_eq!(step_length_rule(0.5, f32::NAN, 1.0), (0.5, false, true));
+        assert_eq!(step_length_rule(0.5, 1.0, 1.0), (1.0, false, false), "over 0.95 of the old");
+        assert_eq!(step_length_rule(0.5, 0.001, 1.0), (0.01, false, false), "clamped");
+        assert_eq!(step_length_rule(0.5, 0.2, 1.0), (0.2, true, false));
     }
 
     /// Upstream rule (`CpuFftBackend` at the f11b4276 pin, #12051): `wx = PI * i / binCntX`; `wy =
