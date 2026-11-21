@@ -19,7 +19,7 @@ cli = ["dep:vyges-opendb", "vyges-opendb/gen-write", "dep:serde_json", "dep:vyge
 # The suite's logger: the run's lines in the reference's format, each also an event (the CLI's
 # events trail).
 vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false }
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "repin-f11b4276", optional = true }
 # Routability-driven placement measures congestion on the global router's grid (its capacities
 # after adjustment), as the reference's RUDY does.
 vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", optional = true, default-features = false, features = ["odb"] }
@@ -27,7 +27,7 @@ vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", o
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
 # Timing-driven placement repairs and re-times the design at each reweight with the resizer
 # (repair_design, the placement-time rebuffering, the driver slacks), on the placer's database.
-vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "main", optional = true, features = ["cli"] }
+vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "repin-f11b4276", optional = true, features = ["cli"] }
 # Concurrent IO placement (`-place_ios`) solves on the pin placer's slot grid
 # (`buildSlotGrid`) and legalizes with its assignment (`runHungarianMatching`).
 vyges-ppl = { git = "https://github.com/vyges-tools/ppl.git", branch = "main", optional = true }
