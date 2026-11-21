@@ -81,6 +81,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/ppl
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-ppl
       # The [patch] paths must resolve even when the features that use them are off.
       - uses: dtolnay/rust-toolchain@1.100.0
@@ -150,6 +151,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/ppl
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-ppl
 
       - name: Toolchain

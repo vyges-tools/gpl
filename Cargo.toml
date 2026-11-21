@@ -30,7 +30,7 @@ vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", o
 vyges-rsz = { git = "https://github.com/vyges-tools/rsz.git", branch = "repin-f11b4276", optional = true, features = ["cli"] }
 # Concurrent IO placement (`-place_ios`) solves on the pin placer's slot grid
 # (`buildSlotGrid`) and legalizes with its assignment (`runHungarianMatching`).
-vyges-ppl = { git = "https://github.com/vyges-tools/ppl.git", branch = "main", optional = true }
+vyges-ppl = { git = "https://github.com/vyges-tools/ppl.git", branch = "repin-f11b4276", optional = true }
 serde_json = { version = "1", optional = true }
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
