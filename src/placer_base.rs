@@ -120,6 +120,22 @@ pub struct IoPort {
     pub constraint: Option<(i32, i32, i32, i32)>,
     /// `getMirroredBTerm()`, when it has one.
     pub mirror: Option<String>,
+    /// `isMirrored()`: the FOLLOWER of a mirrored pair (odb gives it a copy of the master's
+    /// constraint region on the master's own edge).
+    pub is_mirrored: bool,
+}
+
+impl IoPort {
+    /// The constraint region `-place_ios` reads as this pin's own: none for a mirror follower,
+    /// whose region is the master's copy (OpenROAD #12118, a45d7cb8fe, in the f11b4276 pin, as
+    /// ppl's `getConstraintsFromDB`); at 4155ac31 the copy was read as the follower's.
+    pub fn own_constraint(&self) -> Option<(i32, i32, i32, i32)> {
+        if self.is_mirrored {
+            None
+        } else {
+            self.constraint
+        }
+    }
 }
 
 /// What `-place_ios` reads from the block and technology besides the ports.

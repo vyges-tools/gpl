@@ -171,7 +171,8 @@ fn read_io(db: &Db, d: &mut Design) -> Res<()> {
         let net = net_ix.get(&db.bterm_net(&b)).copied();
         let mirror = db.bterm_has_mirrored_b_term(&b).then(|| db.bterm_get_mirrored_b_term(&b));
         let constraint = db.bterm_constraint_region(&b).map_err(e)?;
-        d.ports.push(IoPort { name: b, net, bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), fixed, placed, constraint, mirror });
+        let is_mirrored = db.bterm_is_mirrored(&b);
+        d.ports.push(IoPort { name: b, net, bbox: (r.lx <= r.ux && r.ly <= r.uy).then_some(r), fixed, placed, constraint, mirror, is_mirrored });
     }
     d.io.blocked = db.blocked_regions_for_pins().map_err(e)?;
     d.io.top_grid = db.bterm_top_layer_grid().map_err(e)?.map(|g| {

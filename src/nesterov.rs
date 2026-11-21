@@ -1462,7 +1462,7 @@ fn init_io_pin_base(log: &mut Log, d: &Design, np: &mut Nesterov) -> Res<IoState
         next_calls: 0,
     };
     for (i, &(pi, _)) in movable.iter().enumerate() {
-        if let Some(c) = d.ports[pi].constraint {
+        if let Some(c) = d.ports[pi].own_constraint() {
             if c.0 != c.2 && c.1 != c.3 {
                 io.boxes[i] = Some(c);
             }
@@ -1624,7 +1624,7 @@ fn init_io_constraints(log: &mut Log, d: &Design, movable: &[(usize, Option<usiz
         if io.boxes[i].is_some() {
             continue;
         }
-        let Some(cr) = d.ports[pi].constraint else { continue };
+        let Some(cr) = d.ports[pi].own_constraint() else { continue };
         if let Some(seg) = io_pins::rect_to_seg(&io.die, cr) {
             io.segs[i] = io_pins::intersect_segs(&[seg], &io.free);
             if io.segs[i].is_empty() {
@@ -4738,6 +4738,17 @@ mod tests {
         assert_eq!(settle_wait_step(-1, 30, false, false), (-1, SettleWait::Nothing), "end not reached");
     }
 
+    /// Upstream rule (`IoPinBase`, #12118 in the f11b4276 pin): a mirror follower's constraint
+    /// region (odb's copy of its master's) is not read as its own, box or edge.
+    #[test]
+    fn a_mirror_followers_copied_region_is_not_its_own() {
+        let mut p = io_port("b", None, false, false);
+        p.constraint = Some((0, 10, 0, 20));
+        assert_eq!(p.own_constraint(), Some((0, 10, 0, 20)));
+        p.is_mirrored = true;
+        assert_eq!(p.own_constraint(), None);
+    }
+
     /// Upstream rule (`isRoutabilityGplIter`, #12214 in the f11b4276 pin): a pending routability
     /// pass keeps an iteration a routability one below the end overflow; nothing before the snapshot.
     #[test]
@@ -4857,7 +4868,7 @@ mod tests {
     }
 
     fn io_port(name: &str, net: Option<usize>, fixed: bool, placed: bool) -> crate::placer_base::IoPort {
-        crate::placer_base::IoPort { name: name.into(), net, bbox: None, fixed, placed, constraint: None, mirror: None }
+        crate::placer_base::IoPort { name: name.into(), net, bbox: None, fixed, placed, constraint: None, mirror: None, is_mirrored: false }
     }
 
     /// Upstream rule (`IoPinBase::IoPinBase`, 19901792578; place_ios_rd's `req_msg[0]`): every port
