@@ -301,7 +301,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     log.info("GPL", 96, format!("Created placement cluster of {} instances.", members.len()));
                     clusters.push(members);
                 }
-                "read_liberty" | "define_corners" | "set_wire_rc" | "set_layer_rc" | "set_dont_use" | "read_sdc" | "set_routing_alpha" => {
+                // The timer preamble, replayed by the resizer (its rules: `define_scene` / `set_scene` at the
+                // f11b4276 pin bind read libraries to scenes).
+                "read_liberty" | "define_corners" | "define_scene" | "set_scene" | "set_wire_rc" | "set_layer_rc" | "set_dont_use" | "read_sdc" | "set_routing_alpha" => {
                     rsz_steps.push(step.clone());
                 }
                 "set_thread_count" => {
