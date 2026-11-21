@@ -138,6 +138,17 @@ pub struct Solve {
     pub converged: bool,
 }
 
+/// `cpuSparseSolve`'s per-axis solve at the f11b4276 pin (OpenROAD c56bbf56cc/651cb09441): when
+/// the right-hand side's `squaredNorm()` is 0 — no IO pin, fixed or locked cell holds a position
+/// in that axis — the solver is not run, `x` keeps the current positions and the residual is 0.
+/// Otherwise `solveWithGuess`. (At 4155ac31 the solve ran and Eigen returned the zero vector.)
+pub fn cpu_sparse_solve_axis(mat: &Csr, rhs: &[f32], x: &mut [f32], max_iters: usize) -> Solve {
+    if squared_norm(rhs) == 0.0 {
+        return Solve { iterations: 0, error: 0.0, converged: true };
+    }
+    bicgstab(mat, rhs, x, max_iters)
+}
+
 /// The library's `bicgstab(mat, rhs, x, IdentityPreconditioner, iters, tol_error)` as
 /// `solveWithGuess` calls it: tolerance = float epsilon; `x` is updated in place.
 pub fn bicgstab(mat: &Csr, rhs: &[f32], x: &mut [f32], max_iters: usize) -> Solve {
@@ -230,5 +241,19 @@ mod tests {
         let s = bicgstab(&m, &[1.0, 2.0], &mut x, 100);
         assert!(s.converged, "{s:?}");
         assert!((x[0] - 1.0 / 11.0).abs() < 1e-6 && (x[1] - 7.0 / 11.0).abs() < 1e-6, "{x:?}");
+    }
+
+    /// Upstream rule (`cpuSparseSolve`, f11b4276 pin): a zero right-hand side skips the solve and
+    /// keeps the current positions, residual 0 (the bare solver would zero them).
+    #[test]
+    fn a_zero_right_hand_side_keeps_the_positions() {
+        let m = Csr::from_triplets(2, &[(0, 0, 4.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 3.0)]);
+        let mut x = vec![5.0f32, 7.0];
+        let s = cpu_sparse_solve_axis(&m, &[0.0, 0.0], &mut x, 100);
+        assert_eq!(x, [5.0, 7.0]);
+        assert_eq!((s.error, s.converged), (0.0, true));
+        let mut x = vec![0.0f32; 2];
+        cpu_sparse_solve_axis(&m, &[1.0, 2.0], &mut x, 100);
+        assert!((x[0] - 1.0 / 11.0).abs() < 1e-6, "a nonzero side still solves: {x:?}");
     }
 }

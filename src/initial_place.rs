@@ -426,9 +426,9 @@ pub fn do_bicgstab_place(log: &mut Log, d: &Design, c: &mut Common, v: &Vars, va
         let (mut sx, mut sy) = create_sparse_matrix(c, &ip, vars);
         let n = ip.place.len();
         let mx = Csr::from_triplets(n, &sx.triplets);
-        let ex = bicgstab::bicgstab(&mx, &sx.rhs, &mut sx.x, vars.max_solver_iter);
+        let ex = bicgstab::cpu_sparse_solve_axis(&mx, &sx.rhs, &mut sx.x, vars.max_solver_iter);
         let my = Csr::from_triplets(n, &sy.triplets);
-        let ey = bicgstab::bicgstab(&my, &sy.rhs, &mut sy.x, vars.max_solver_iter);
+        let ey = bicgstab::cpu_sparse_solve_axis(&my, &sy.rhs, &mut sy.x, vars.max_solver_iter);
         log.trace(format!("VYGIPS|{iter}|x|{}|{:08x}|{}|{:016x}", ex.iterations, ex.error.to_bits(), if ex.converged { 0 } else { 2 }, fnv(&sx.x)));
         log.trace(format!("VYGIPS|{iter}|y|{}|{:08x}|{}|{:016x}", ey.iterations, ey.error.to_bits(), if ey.converged { 0 } else { 2 }, fnv(&sy.x)));
         if ex.error.is_nan() || ey.error.is_nan() {
